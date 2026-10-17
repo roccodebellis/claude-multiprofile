@@ -8,6 +8,7 @@
 import { getRegistry, registryLocation, registryHealth } from "../registry.js";
 import { detectDefaults } from "../detect.js";
 import { resolveClaude } from "../claudebin.js";
+import { profileShell } from "../code.js";
 import {
   detectShell,
   rcPathForShell,
@@ -28,6 +29,8 @@ import {
   dim,
   printLaunchHints,
 } from "../util.js";
+import { clonePathFor } from "../appclone.js";
+import { wantsOwnIdentity, ownIdentityFor, readIdentity, identityStatus } from "../identity.js";
 
 export async function status() {
   header("Claude profiles status");
@@ -35,7 +38,14 @@ export async function status() {
   const defaults = detectDefaults();
   const reg = getRegistry();
   const shell = detectShell();
-  const aliasNames = new Set(readManagedAliases(shell).map((a) => a.name));
+  // Each profile is checked against the rc file it recorded (#21), not the
+  // one for $SHELL, which can differ when status runs from another shell.
+  const aliasesIn = new Map();
+  const aliasPresent = (p) => {
+    const { shell: s, rcPath } = profileShell(p);
+    if (!aliasesIn.has(rcPath)) aliasesIn.set(rcPath, new Set(readManagedAliases(s, rcPath).map((a) => a.name)));
+    return { ok: aliasesIn.get(rcPath).has(p.code.aliasName), rcPath };
+  };
 
   if (registryHealth().state === "corrupt") {
     warn(`The registry at ${pathStr(tildify(registryLocation()))} is not valid JSON.`);
@@ -112,11 +122,20 @@ export async function status() {
         `    ${claudeOk ? "✓" : "✗"} Claude.app source: ${p.desktop.claudeAppPath}`
       );
       if (!claudeOk) issues++;
+
+      // A profile with its own app identity: is it on the copy? The deeper
+      // checks (signature, launcher) are doctor's.
+      if (wantsOwnIdentity(p.desktop)) {
+        const wanted = ownIdentityFor(p.name, p.desktop);
+        const state = identityStatus({ wanted, actual: readIdentity(clonePathFor(p.name)), signed: null });
+        console.log(`    ${state === "ok" ? "✓" : "✗"} Own identity: ${wanted.bundleId}`);
+        if (state !== "ok") issues++;
+      }
     }
 
     if (p.code) {
       const cfgOk = fileExists(p.code.configDir);
-      const aliasOk = aliasNames.has(p.code.aliasName);
+      const { ok: aliasOk, rcPath: aliasRc } = aliasPresent(p);
 
       console.log(
         `    ${cfgOk ? "✓" : "✗"} Code config folder: ${tildify(p.code.configDir)}`
@@ -124,7 +143,7 @@ export async function status() {
       if (!cfgOk) issues++;
 
       console.log(
-        `    ${aliasOk ? "✓" : "✗"} Shell alias "${p.code.aliasName}" in ${tildify(rcPathForShell(shell))}`
+        `    ${aliasOk ? "✓" : "✗"} Shell alias "${p.code.aliasName}" in ${tildify(aliasRc)}`
       );
       if (!aliasOk) issues++;
     }

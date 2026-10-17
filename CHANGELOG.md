@@ -3,6 +3,168 @@
 All notable changes to claude-multiprofile. Versions follow semver; the
 project is pre-1.0, so minor breakage may occur between 0.x releases.
 
+## Unreleased
+
+### Added
+
+- **A Desktop profile can be its own app to macOS.** A profile's copy of
+  Claude.app is a clone, so macOS treats it and `/Applications/Claude.app`
+  as one application: same bundle ID, same signature, same name. Anything
+  addressed to the app by identity reaches both. Found on 2026-10-08:
+  granting Screen Recording to one profile ended with macOS's "Quit &
+  Reopen", which quit every running copy; both windows showed Claude's
+  "still working" prompt in the same second (the shared `main.log` has the
+  two `beforeQuit` lines), and the answer given in one interrupted the work
+  in the other. AppleScript's `tell application "Claude"` and `open -b`
+  pick one of the two at random for the same reason, and a permission
+  granted to one is granted to all.
+
+  `claude-multiprofile identity <name> own` (or saying yes in `add`) gives
+  the copy its own identity: bundle ID `com.claude-multiprofile.<name>.claude`,
+  the launcher's name in the menu bar and Dock (its helper apps are renamed
+  with it, since Electron finds them by the app name), its own permission
+  grants. (Not its own Keychain entry: Electron names that after the
+  product name built into Claude, so the copy still uses `Claude Safe
+  Storage`, and macOS asks before it reads it.) The copy is
+  re-signed on this Mac for that, with the entitlements that need Apple's
+  provisioning profile dropped, the hardened runtime kept with library
+  validation relaxed for Claude's Anthropic-signed native modules (`DYLD_*`
+  injection stays blocked). It is signed with a key made once per Mac
+  (`claude-multiprofile local signing`, self-signed, not extractable, in the
+  login keychain), and its designated requirement is the bundle ID and that
+  key's certificate: a copy rebuilt after a Claude update is the same app to
+  TCC and the Keychain, and no other program can claim to be it. The key
+  asks for the login password each time it signs, so once per Claude update;
+  it is created on first use and `doctor --fix` re-signs copies signed
+  without it. The launch helper
+  (v3) applies the identity when it rebuilds a copy, and adopts a copy that
+  lacks the identity its profile wants. The identity is always applied to a
+  clone beside the copy and swapped in only once its signature verifies, so
+  a failure or a cut-off run leaves the copy as it was; an adoption is
+  logged before it starts, so `doctor` reports one that was cut off, and
+  the click after a cut opens the copy as is and adopts on the next. `doctor` checks that the registry,
+  the copy and the launcher agree, and `doctor --fix` repairs drift.
+  `identity <name> shared` rebuilds the copy from `/Applications/Claude.app`,
+  the only thing that restores Anthropic's signature.
+
+  Off by default, because it trades Anthropic's signature on the copy for
+  the separation: sign-in methods that need Claude's keychain access groups
+  (passkeys, hardware keys, Microsoft Entra) are unavailable in such a copy,
+  and a profile switched over signs in again once. The README's new "Own app
+  identity" section states all of it.
+
+- `claude-multiprofile identity [name] [own|shared]`, and an "own app
+  identity" question in `add`. `list` and `status` show it.
+
+### Changed
+
+- The JXA runner moved from `src/appclone.js` to `src/jxa.js`, shared with
+  the identity work.
+
+## 0.1.36 (2026-10-16)
+
+### Fixed
+
+- **A profile named "claude-something" got a doubled name.** Reported in
+  #24. The tool already puts Claude in front of everything it names, so a
+  profile called `claude-qpg` became `Claude Claude Qpg.app` and the command
+  `claude-claude-qpg`. `add` and `rename` now refuse a new name that starts
+  with "claude-" and suggest the name without it. A profile that already has
+  such a name keeps working, and `rename` can take it to a shorter one.
+
+### Documentation
+
+- **Why "Sign in with Google" can hang in a new profile** (#24). For Google,
+  Claude Desktop uses Apple's in-app sign-in sheet unless it believes it is
+  the app that handles `claude://` links, and it decides that by bundle ID. A
+  profile's copy shares Claude's bundle ID, so it always signs in through the
+  browser instead, and the `claude://` link that finishes the sign-in goes to
+  the main Claude if it is open, which ignores it. The README now explains
+  this next to the workaround: quit every other Claude window for the
+  profile's first sign-in. A profile with its own bundle ID (#22, in review)
+  would use the in-app sheet and avoid it.
+
+## 0.1.35 (2026-10-13)
+
+### Fixed
+
+- **`status` and `doctor` reported every alias missing when run from a
+  different shell.** Reported by @picosam in #21. Each profile records the rc
+  file its alias was written to, but both commands looked in the file for
+  the current `$SHELL` instead. From a Claude Code session set up with bash
+  on a zsh machine, every alias read as missing although it was in
+  `~/.zshrc` all along. They now check the file each profile recorded, and
+  `remove`, `rename` and turning on per-profile gh logins edit that file too,
+  so none of them can write an alias into a file your login shell never
+  reads. Profiles from before the rc path was recorded still fall back to
+  `$SHELL`.
+- **Launchers showed up as "staged" in Raycast, Alfred and the app
+  switcher.** Fixed by @Onatcer in #14: launchers are compiled under their own
+  file name, so new ones are named after themselves. Launchers created since
+  v0.1.24 keep the old name because a rebuild only swaps the script inside
+  them, so `doctor` now finds launchers named exactly "staged" and `--fix`
+  renames them after their file. A name you set yourself is never touched.
+
+### Security
+
+Three fixes from @tajchert, each with tests:
+
+- **Profile paths are escaped in generated aliases** (#18, closes #15). A
+  config path containing quotes, `$`, or backticks could break out of the
+  alias and run as shell code when the rc file loaded. Paths are now quoted
+  as data for zsh, bash and fish.
+- **Copying into a profile never writes through a link out of it** (#19,
+  closes #16). Seeding, path rebasing and extension copying refuse a target
+  that resolves outside the profile, so a symlinked file or folder in a new
+  profile cannot redirect the copy elsewhere on disk. Review additions guard
+  the two other writers with the same exposure: the `claudeMdExcludes`
+  restore in `doctor --fix`, and `extensions` copying an extension's settings.
+- **Copied credentials are disclosed, and new profiles are owner-only**
+  (#20, closes #17). The seeding prompt now says plainly that settings and
+  MCP servers come over as they are, API keys and tokens included. New config
+  folders are created readable by you alone (0700), and the copied
+  `.claude.json` with MCP servers is written 0600.
+
+## 0.1.34 (2026-10-13)
+
+### Fixed
+
+- **On macOS 27, clicking a profile after a Claude update could do nothing.**
+  Reported by @picosam in #13, with two detailed traces, and hit on the
+  maintainer's own machine after upgrading to 27.0.1. The launcher started the
+  launch helper in the background and quit at once. On macOS 27, about a
+  second after an app quits, loginwindow force-quits every process that app
+  is responsible for (the system log reads `force quit (caller responsible
+  for termination)`), and the helper, started by the launcher, is one of
+  them. When the copy needed updating, the helper was killed part-way: how
+  far it got decided what was left (a half-made copy with no `Info.plist`,
+  or a tinted one never swapped in, or a swap with nothing opened), with no
+  log line and no window. When no update was needed it opened Claude fast
+  enough to beat the force-quit, which is why it only failed after updates.
+  The icon-tint fault visible in crash reports occurs on successful runs too
+  and was not the cause.
+
+  The launcher now waits for the helper to finish before it quits, so there
+  is nothing left for macOS to force-quit; Claude itself is started through
+  LaunchServices and is not the launcher's to take down. Verified with a real
+  launcher click on macOS 27.0.1: the same click that left a half-made copy
+  before now updates the copy, opens it, and logs both steps.
+
+  `upgrade` rebuilds existing launchers in place through `doctor --fix`, so
+  Dock pins keep working.
+
+### Added
+
+- **The launch helper (v2) recovers from an update that was cut off.** It
+  logs "updating the copy from X to Y" before starting, so a run that dies
+  part-way leaves a trace. The next click puts the copy back if the cut fell
+  between swapping the two copies, removes what was left behind, and opens
+  the profile; the click after that does the update. A profile never stays
+  unopenable because the last attempt died.
+- **`doctor` reports launchers that do not wait for the helper, updates that
+  were cut off, and the folders they left**, and `--fix` rebuilds the
+  launcher in place and cleans up while the profile is closed.
+
 ## 0.1.33 (2026-10-05)
 
 ### Changed

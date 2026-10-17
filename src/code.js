@@ -32,7 +32,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { HOME, pathStr, tildify, ok, info, warn, step } from "./util.js";
+import { HOME, pathStr, tildify, ok, info, warn, step, fileStaysWithinDir } from "./util.js";
 import { resolveBinaries } from "./claudebin.js";
 import {
   detectShell,
@@ -96,7 +96,7 @@ export function ensureConfigDir(configDir, { seedFromDefault } = {}) {
   if (seedFromDefault && fs.existsSync(DEFAULT_CLAUDE_CONFIG_DIR)) {
     return seedConfigDir(DEFAULT_CLAUDE_CONFIG_DIR, configDir);
   }
-  fs.mkdirSync(configDir, { recursive: true });
+  fs.mkdirSync(configDir, { recursive: true, mode: 0o700 });
   return true;
 }
 
@@ -146,8 +146,16 @@ export const SEED_PLUGIN_ITEMS = [
 // taken from it.
 export const DEFAULT_USER_CONFIG_FILE = path.join(HOME, ".claude.json");
 
-function copyEntry(from, to) {
+function copyEntry(from, to, { independent = false } = {}) {
   fs.mkdirSync(path.dirname(to), { recursive: true });
+  if (independent) {
+    if (!fileStaysWithinDir(to, path.dirname(to))) {
+      throw new Error(`Refusing to copy setup through an external symlink: ${to}`);
+    }
+    // Copy contents, not a source symlink: rebasing must not edit the source.
+    fs.copyFileSync(from, to);
+    return;
+  }
   // -c asks for an APFS clone, which makes even a large plugins folder cost
   // almost nothing; other filesystems fall back to a real copy.
   try {
@@ -223,6 +231,7 @@ function rebaseValue(value, fromDir, toDir, exists, keys) {
 // values under those top-level keys are considered. A file that does not
 // parse is left exactly as it is. Returns true if anything changed.
 export function rebaseJsonFile(file, fromDir, toDir, { keys = null } = {}) {
+  if (!fileStaysWithinDir(file, toDir)) return false;
   let before;
   try {
     before = JSON.parse(fs.readFileSync(file, "utf8"));
@@ -267,6 +276,9 @@ export function pathsIntoOtherProfile(file, fromDir, toDir, { keys = null } = {}
 // profile, so pointing it back is safe. Returns [{ from, to }] for each entry
 // that would change; with `apply`, writes the file.
 export function flippedClaudeMdExcludes(settingsFile, profileDir, defaultDir, { apply = false } = {}) {
+  // A settings.json that is a link out of the profile (shared settings) is
+  // not this profile's to rewrite (#16), the same rule rebaseJsonFile follows.
+  if (!fileStaysWithinDir(settingsFile, profileDir)) return [];
   let settings;
   try {
     settings = JSON.parse(fs.readFileSync(settingsFile, "utf8"));
@@ -320,13 +332,13 @@ export function copiedTranscripts(profileDir, sourceDir) {
 
 // Returns a summary: { items: [...copied names], plugins: bool, mcpServers: n }.
 export function seedConfigDir(fromDir, toDir, { userConfigFile = DEFAULT_USER_CONFIG_FILE } = {}) {
-  fs.mkdirSync(toDir, { recursive: true });
+  fs.mkdirSync(toDir, { recursive: true, mode: 0o700 });
   const summary = { items: [], plugins: false, mcpServers: 0 };
 
   for (const item of SEED_ITEMS) {
     const src = path.join(fromDir, item);
     if (!fs.existsSync(src)) continue;
-    copyEntry(src, path.join(toDir, item));
+    copyEntry(src, path.join(toDir, item), { independent: item === "settings.json" });
     summary.items.push(item);
   }
 
@@ -334,7 +346,11 @@ export function seedConfigDir(fromDir, toDir, { userConfigFile = DEFAULT_USER_CO
   if (fs.existsSync(pluginsFrom)) {
     for (const item of SEED_PLUGIN_ITEMS) {
       const src = path.join(pluginsFrom, item);
-      if (fs.existsSync(src)) copyEntry(src, path.join(toDir, "plugins", item));
+      if (fs.existsSync(src)) {
+        copyEntry(src, path.join(toDir, "plugins", item), {
+          independent: ["installed_plugins.json", "known_marketplaces.json"].includes(item),
+        });
+      }
     }
     for (const manifest of ["installed_plugins.json", "known_marketplaces.json"]) {
       const f = path.join(toDir, "plugins", manifest);
@@ -351,7 +367,7 @@ export function seedConfigDir(fromDir, toDir, { userConfigFile = DEFAULT_USER_CO
     const servers = JSON.parse(fs.readFileSync(userConfigFile, "utf8")).mcpServers;
     if (servers && typeof servers === "object" && Object.keys(servers).length > 0) {
       const file = path.join(toDir, ".claude.json");
-      fs.writeFileSync(file, JSON.stringify({ mcpServers: servers }, null, 2) + "\n", "utf8");
+      fs.writeFileSync(file, JSON.stringify({ mcpServers: servers }, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
       rebaseJsonFile(file, fromDir, toDir);
       summary.mcpServers = Object.keys(servers).length;
     }
@@ -363,23 +379,34 @@ export function seedConfigDir(fromDir, toDir, { userConfigFile = DEFAULT_USER_CO
 
 // ---- Shell alias setup ---------------------------------------------------
 
-export function addAlias({ aliasName, configDir, ghConfigDir }) {
+// Which shell and rc file an existing profile's alias lives in: the ones it
+// recorded when it was created, falling back to the current shell only for
+// profiles that predate the record. Editing an existing profile must use these,
+// not $SHELL (#21), or `remove` leaves the alias behind and `rename` writes the
+// new one into a different file.
+export function profileShell(profile) {
+  const code = (profile && profile.code) || {};
+  const shell = code.shell || detectShell();
+  return { shell, rcPath: code.rcPath || rcPathForShell(shell) };
+}
+
+// `shell` and `rcPath` default to the current shell, which is right for a new
+// profile; pass profileShell(profile) when editing an existing one.
+export function addAlias({ aliasName, configDir, ghConfigDir, shell = detectShell(), rcPath = rcPathForShell(shell) }) {
   // We rebuild the entire managed block on every write rather than
   // appending. This keeps the aliases in a stable order (alphabetical)
   // and prevents duplicates.
-  const shell = detectShell();
-  const existing = readManagedAliases(shell).filter((a) => a.name !== aliasName);
+  const existing = readManagedAliases(shell, rcPath).filter((a) => a.name !== aliasName);
   const newLine = buildAliasLine(shell, aliasName, configDir, ghConfigDir);
   const allLines = [...existing.map((a) => a.line), newLine].sort();
-  const rcPath = writeAliases(shell, allLines);
+  writeAliases(shell, allLines, rcPath);
   return { shell, rcPath };
 }
 
-export function removeAlias(aliasName) {
-  const shell = detectShell();
-  const remaining = readManagedAliases(shell).filter((a) => a.name !== aliasName);
+export function removeAlias(aliasName, { shell = detectShell(), rcPath = rcPathForShell(shell) } = {}) {
+  const remaining = readManagedAliases(shell, rcPath).filter((a) => a.name !== aliasName);
   const lines = remaining.map((a) => a.line).sort();
-  const rcPath = writeAliases(shell, lines);
+  writeAliases(shell, lines, rcPath);
   return { shell, rcPath };
 }
 
@@ -402,7 +429,7 @@ export function setupCode({ name, configDir, aliasName, seedFromDefault, isolate
       if (created.mcpServers) parts.push(`${created.mcpServers} MCP server${created.mcpServers === 1 ? "" : "s"}`);
       ok(`Config folder created and seeded from ${pathStr(tildify(DEFAULT_CLAUDE_CONFIG_DIR))}.`);
       ok(parts.length ? `Carried over: ${parts.join(", ")}.` : "There was no setup to carry over.");
-      info("Not carried over: conversations, prompt history, sessions, caches, or sign-in.");
+      info("Not carried over: conversations, prompt history, sessions, caches, or Keychain sign-in.");
     } else {
       ok("Config folder created (empty).");
     }

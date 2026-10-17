@@ -42,6 +42,7 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { ensureColoredClone, applyColor, clonePathFor, psSnapshot } from "./appclone.js";
 import { installHelper, helperSpecFor } from "./launchhelper.js";
+import { wantsOwnIdentity, ownIdentityFor } from "./identity.js";
 import { blockUpdates } from "./updates.js";
 import {
   HOME,
@@ -53,6 +54,7 @@ import {
   step,
   tildify,
   fileExists,
+  fileStaysWithinDir,
   titleCase,
 } from "./util.js";
 
@@ -165,6 +167,9 @@ export function seedDesktopMcpServers(
   if (Object.keys(servers).length === 0) return nothing;
 
   const file = desktopConfigFile(dataDir);
+  if (!fileStaysWithinDir(file, dataDir)) {
+    return { status: "foreign", reason: "unsafe-path", added: [], total: 0 };
+  }
   let config = {};
   if (fileExists(file)) {
     try {
@@ -269,9 +274,23 @@ export function buildLaunchAppleScript(dataDir, claudeAppPath, codeConfigDir, gh
   if (ghConfigDir) openArgs.push("--env", `GH_CONFIG_DIR=${ghConfigDir}`);
   openArgs.push("--args", `--user-data-dir=${dataDir}`);
   const helperArgs = [claudeAppPath, helper.source, helper.hue || "", dataDir, helper.label, ...openArgs];
+  // A profile with its own app identity (src/identity.js) tells the helper
+  // through the environment rather than a positional argument, so launchers
+  // built before and after agree on what the arguments mean.
+  const identityEnv = helper.identity ? `CMP_LAUNCH_IDENTITY=${shellQuote(helper.identity)} ` : "";
+  // The launcher WAITS for the helper (no trailing `&`), and that is
+  // load-bearing (#13). On macOS 27, about a second after an app quits,
+  // loginwindow force-quits every process that app is responsible for
+  // ("force quit (caller responsible for termination)"). The helper is one of
+  // them, being started by the launcher, so a launcher that started it in the
+  // background and quit at once had it killed mid-update: a half-made copy
+  // left behind, no log line, nothing opened. Waiting keeps the launcher
+  // alive until the helper has finished and Claude is open. Claude itself is
+  // started through LaunchServices by `open`, so it is not the launcher's to
+  // take down.
   const cmd =
     `if [ -f ${shellQuote(helper.path)} ]; then ` +
-    `/usr/bin/osascript -l JavaScript ${shellQuote(helper.path)} ${helperArgs.map(shellQuote).join(" ")} > /dev/null 2>&1 & ` +
+    `${identityEnv}/usr/bin/osascript -l JavaScript ${shellQuote(helper.path)} ${helperArgs.map(shellQuote).join(" ")} > /dev/null 2>&1; ` +
     `else ${openLine} fi`;
   return `do shell script ${appleScriptString(cmd)}`;
 }
@@ -286,6 +305,16 @@ export function launcherUsesHelper(appPath) {
   const src = readLauncherScript(appPath);
   if (src === null) return undefined;
   return src.includes("claude-multiprofile/bin/launch.js");
+}
+
+// Whether a helper-using launcher waits for the helper rather than starting
+// it in the background. Launchers built before v0.1.34 background it, and on
+// macOS 27 that gets the helper killed part-way through an update (#13).
+// Returns undefined when the script cannot be read or uses no helper.
+export function launcherWaitsForHelper(appPath) {
+  const src = readLauncherScript(appPath);
+  if (src === null || !src.includes("claude-multiprofile/bin/launch.js")) return undefined;
+  return !/2>&1 & else /.test(src);
 }
 
 // Wrap a value in shell single quotes, escaping embedded apostrophes the POSIX
@@ -379,6 +408,16 @@ export function launcherCodeConfigDir(appPath) {
 
 export function launcherGhConfigDir(appPath) {
   return launcherEnvVar(appPath, "GH_CONFIG_DIR");
+}
+
+// The app identity a launcher hands its helper (CMP_LAUNCH_IDENTITY=...): the
+// bundle ID, null if the launcher passes none, undefined if the script can't
+// be read. Bundle IDs are [a-z0-9.-], so no un-escaping is needed.
+export function launcherIdentity(appPath) {
+  const src = readLauncherScript(appPath);
+  if (src === null) return undefined;
+  const m = src.match(/CMP_LAUNCH_IDENTITY='([^']*)' \/usr\/bin\/osascript/);
+  return m ? m[1] : null;
 }
 
 export function uniqueBundleId(name) {
@@ -512,6 +551,37 @@ export function setBundleId(appPath, bundleId) {
   return true;
 }
 
+// The launcher's display name: what Raycast, Alfred, Spotlight's app list and
+// the app switcher show. osacompile sets it from the path it compiles to, and
+// until #14 that was a temporary "staged.app", so launchers created between
+// v0.1.24 and v0.1.34 are named "staged". plutil takes the value as its own
+// argument, so names with spaces need no quoting.
+export const STAGED_LAUNCHER_NAME = "staged";
+
+export function getBundleName(appPath) {
+  const plist = path.join(appPath, "Contents", "Info.plist");
+  if (!fileExists(plist)) return null;
+  try {
+    return execFileSync("/usr/bin/plutil", ["-extract", "CFBundleName", "raw", "-o", "-", plist], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trim();
+  } catch {
+    return null;
+  }
+}
+
+export function setBundleName(appPath, name) {
+  const plist = path.join(appPath, "Contents", "Info.plist");
+  if (!fileExists(plist)) return false;
+  try {
+    execFileSync("/usr/bin/plutil", ["-replace", "CFBundleName", "-string", name, plist], { stdio: "pipe" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function stripQuarantine(appPath) {
   // Removes any com.apple.quarantine attribute applied by Gatekeeper. On a
   // freshly osacompile'd bundle there usually isn't one, but if the user
@@ -557,6 +627,7 @@ export function launchTargetFor(name, desktop) {
       dedicatedBundle: true,
       sourceAppPath: desktop.claudeAppPath,
       color: desktop.color || null,
+      identity: wantsOwnIdentity(desktop) ? ownIdentityFor(name, desktop) : null,
     };
   }
   return { claudeAppPath: desktop.claudeAppPath, dedicatedBundle: false };
@@ -572,6 +643,7 @@ export function compileApp({
   dedicatedBundle = false,
   sourceAppPath = null,
   color = null,
+  identity = null,
 }) {
   // We write the AppleScript to a temp file then run `osacompile` to turn
   // it into a real .app bundle. osacompile is part of macOS, no install
@@ -590,7 +662,7 @@ export function compileApp({
   let helper = null;
   if (dedicatedBundle && sourceAppPath) {
     installHelper();
-    helper = helperSpecFor({ sourceAppPath, color, appPath });
+    helper = helperSpecFor({ sourceAppPath, color, appPath, identity: identity ? identity.bundleId : null });
   }
   const script = buildLaunchAppleScript(dataDir, claudeAppPath, codeConfigDir, ghConfigDir, dedicatedBundle, helper);
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cp-"));
@@ -602,7 +674,9 @@ export function compileApp({
   fs.mkdirSync(path.dirname(appPath), { recursive: true });
 
   // Compile into the temp directory first, never straight over the target.
-  const staged = path.join(tmpDir, "staged.app");
+  // Use the launcher's own filename: osacompile names the bundle after it,
+  // and that CFBundleName is what Raycast, Alfred and the app switcher show.
+  const staged = path.join(tmpDir, path.basename(appPath));
   execFileSync("/usr/bin/osacompile", ["-o", staged, scriptPath], {
     stdio: "pipe",
   });
@@ -705,9 +779,11 @@ export function setupDesktop({
   ghConfigDir,
   color,
   seedConnectors = false,
+  identity = null,
 }) {
   // Wraps the whole setup. Returns a summary the wizard can save to the
-  // registry and print to the user.
+  // registry and print to the user. `identity` is "own" for a profile whose
+  // copy of Claude is its own app to macOS (src/identity.js), else null.
   step(`Creating Claude Desktop profile "${name}"`);
 
   info(`Data folder: ${pathStr(tildify(dataDir))}`);
@@ -730,7 +806,9 @@ export function setupDesktop({
     } else if (mcp.status === "current") {
       ok(`MCP connectors already in place (${mcp.total}).`);
     } else if (mcp.status === "foreign") {
-      warn("This data folder's claude_desktop_config.json could not be parsed; left it alone.");
+      warn(mcp.reason === "unsafe-path"
+        ? "This data folder's claude_desktop_config.json resolves outside the profile or has a broken link; left it alone."
+        : "This data folder's claude_desktop_config.json could not be parsed; left it alone.");
       info(`  Its connectors stay as they are. ${command("claude-multiprofile doctor")} re-checks this.`);
     }
   }
@@ -751,10 +829,12 @@ export function setupDesktop({
   // because the blocks stay shared with the original.
   let launchTarget = claudeAppPath;
   let clonePath = null;
+  const ownIdentity = identity === "own" ? ownIdentityFor(name, { appPath }) : null;
   try {
-    clonePath = ensureColoredClone({ name, claudeAppPath, color: color || null });
+    clonePath = ensureColoredClone({ name, claudeAppPath, color: color || null, identity: ownIdentity });
     launchTarget = clonePath;
     ok(color ? `Claude clone ready (${color}).` : "Claude clone ready for this profile.");
+    if (ownIdentity) ok(`Its own app identity: ${ownIdentity.appName} (${ownIdentity.bundleId}).`);
   } catch (e) {
     warn(`Could not build this profile's Claude clone: ${e.message}`);
     warn("Falling back to the shared Claude.app. Each click will open a new window.");
@@ -771,6 +851,7 @@ export function setupDesktop({
     dedicatedBundle: Boolean(clonePath),
     sourceAppPath: claudeAppPath,
     color,
+    identity: clonePath ? ownIdentity : null,
   });
   ok("Launcher .app compiled.");
 
@@ -808,5 +889,13 @@ export function setupDesktop({
     }
   }
 
-  return { dataDir, appPath, claudeAppPath, color: color || null, clonePath };
+  return {
+    dataDir,
+    appPath,
+    claudeAppPath,
+    color: color || null,
+    clonePath,
+    identity: clonePath && ownIdentity ? "own" : null,
+    bundleId: clonePath && ownIdentity ? ownIdentity.bundleId : null,
+  };
 }
