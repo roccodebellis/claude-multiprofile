@@ -120,9 +120,13 @@ export function parseManagedLine(line) {
   return m ? m[1] : null;
 }
 
-export function readManagedAliases(shell) {
+// Every reader and writer below takes an optional rcPath. An existing
+// profile records the rc file its alias was written to, and that is the one
+// to read and edit, whatever $SHELL says right now (#21): run from a Claude
+// Code session configured with a different shell, $SHELL points elsewhere and
+// every alias looked missing. Without rcPath, the file for `shell` is used.
+export function readManagedAliases(shell, rcPath = rcPathForShell(shell)) {
   // Returns an array of { name, line } entries currently inside our block.
-  const rcPath = rcPathForShell(shell);
   const content = readRcFile(rcPath);
   const { inside, hasBlock } = extractBlock(content);
   if (!hasBlock) return [];
@@ -132,10 +136,10 @@ export function readManagedAliases(shell) {
     .filter((e) => e.name);
 }
 
-export function readAliasStamp(shell) {
+export function readAliasStamp(shell, rcPath = rcPathForShell(shell)) {
   // When our managed block last changed, in epoch ms, or null if the block
   // predates stamping or is absent.
-  const { inside, hasBlock } = extractBlock(readRcFile(rcPathForShell(shell)));
+  const { inside, hasBlock } = extractBlock(readRcFile(rcPath));
   if (!hasBlock) return null;
   for (const line of inside.split("\n")) {
     const trimmed = line.trim();
@@ -146,10 +150,9 @@ export function readAliasStamp(shell) {
   return null;
 }
 
-export function writeAliases(shell, aliasLines) {
+export function writeAliases(shell, aliasLines, rcPath = rcPathForShell(shell)) {
   // Replace (or insert) our managed block with the given alias lines.
   // `aliasLines` is an array of full `alias foo='bar'` strings.
-  const rcPath = rcPathForShell(shell);
   const content = readRcFile(rcPath);
   const { before, after, hasBlock } = extractBlock(content);
 
@@ -167,14 +170,14 @@ export function writeAliases(shell, aliasLines) {
   // Only re-stamp when the aliases actually differ. Rewriting the timestamp
   // on a no-op write would claim a change that did not happen, and would
   // churn the rc file for anyone who keeps their dotfiles in git.
-  const previous = readManagedAliases(shell).map((a) => a.line);
+  const previous = readManagedAliases(shell, rcPath).map((a) => a.line);
   const unchanged =
     hasBlock &&
     previous.length === aliasLines.length &&
     previous.every((line, i) => line === aliasLines[i]);
   // An unchanged block with no stamp stays unstamped rather than gaining an
   // invented one. It picks up a real timestamp the next time it changes.
-  const stamp = unchanged ? readAliasStamp(shell) : Date.now();
+  const stamp = unchanged ? readAliasStamp(shell, rcPath) : Date.now();
 
   const block = [
     BLOCK_START,
@@ -202,16 +205,19 @@ export function writeAliases(shell, aliasLines) {
 }
 
 export function buildAliasLine(shell, aliasName, configDir, ghConfigDir) {
-  // We use single quotes so $HOME stays literal and gets expanded by the
-  // shell at alias-call time, not at definition time. That keeps the alias
-  // portable across machines if the user syncs their dotfiles.
+  // Paths are data, never shell code. Escape double-quoted values for the
+  // shell that will run them, then escape the outer Bash/Zsh alias literal.
   //
   // GH_CONFIG_DIR is optional. When set, the GitHub CLI reads its hosts.yml
   // (and therefore which account it is logged in as) from the profile's own
   // directory. Claude Code passes its environment to the shell commands it
   // runs, so every `gh` call made inside this profile uses that account.
-  const env = [`CLAUDE_CONFIG_DIR="${configDir}"`];
-  if (ghConfigDir) env.push(`GH_CONFIG_DIR="${ghConfigDir}"`);
+  const quotePath = (value) => {
+    const special = shell === "fish" ? /[\\"$]/g : /[\\"$`]/g;
+    return `"${String(value).replace(special, (c) => "\\" + c)}"`;
+  };
+  const env = [`CLAUDE_CONFIG_DIR=${quotePath(configDir)}`];
+  if (ghConfigDir) env.push(`GH_CONFIG_DIR=${quotePath(ghConfigDir)}`);
   const prefix = env.join(" ");
 
   if (shell === "fish") {
@@ -220,7 +226,8 @@ export function buildAliasLine(shell, aliasName, configDir, ghConfigDir) {
     // and Zsh do.
     return `function ${aliasName}; ${prefix} claude $argv; end`;
   }
-  return `alias ${aliasName}='${prefix} claude'`;
+  const body = `${prefix} claude`.replace(/'/g, "'\\''");
+  return `alias ${aliasName}='${body}'`;
 }
 
 // ---- Is this terminal running the aliases that are on disk? ---------------

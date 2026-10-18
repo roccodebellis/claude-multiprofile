@@ -56,6 +56,7 @@ import {
   ghTokenOverride,
   defaultGhConfigDirFor,
   addAlias,
+  profileShell,
 } from "../code.js";
 import { detectShell, rcPathForShell } from "../shell.js";
 import { COLORS } from "../appclone.js";
@@ -82,6 +83,16 @@ export const RESERVED_NAMES = {
   // configuration, and the profile would run inside it.
   "3p": "the main Claude's local configuration folder (~/Library/Application Support/Claude-3p)",
 };
+
+// Every name the tool derives already starts with Claude: the launcher is
+// "Claude <Name>.app", the alias "claude-<name>", the folders ~/.claude-<name>
+// and Claude-<NAME>. A name that starts with "claude" itself doubles it, as in
+// "Claude Claude Qpg.app" and `claude-claude-qpg` (#24). Returns the name
+// without the prefix, or null when there is nothing to drop.
+export function withoutClaudePrefix(name) {
+  const m = String(name).match(/^claude-+(.+)$/);
+  return m ? m[1] : null;
+}
 
 // A complete profile can still gain something: its own GitHub CLI login, if
 // gh is installed and the profile has a Code half that is not isolated yet.
@@ -174,6 +185,11 @@ export async function add() {
       }
       if (RESERVED_NAMES[cleaned]) {
         return `"${cleaned}" is reserved. It would collide with ${RESERVED_NAMES[cleaned]}. Pick another name.`;
+      }
+      // An existing profile keeps whatever name it already has.
+      const shorter = withoutClaudePrefix(cleaned);
+      if (shorter && !findProfile(cleaned)) {
+        return `Leave out "claude-": the tool adds it, so "${cleaned}" would become Claude ${titleCase(cleaned)}.app and the command claude-${cleaned}. Suggestion: "${shorter}"`;
       }
       // An existing name is only an error when there is nothing left to add.
       // A Desktop-only profile that needs Claude Code (or the reverse) is a
@@ -278,6 +294,7 @@ export async function add() {
           appPath: desktopResult.appPath,
           claudeAppPath: desktopResult.claudeAppPath,
           color: desktopResult.color || null,
+          ...(desktopResult.identity ? { identity: desktopResult.identity, bundleId: desktopResult.bundleId } : {}),
         }
       : null,
     code: codeResult
@@ -368,6 +385,7 @@ async function enableGhForProfile(profile) {
     aliasName: profile.code.aliasName,
     configDir: profile.code.configDir,
     ghConfigDir,
+    ...profileShell(profile),
   });
   ok(`Alias "${profile.code.aliasName}" updated in ${pathStr(tildify(rcPath))}.`);
 
@@ -517,6 +535,7 @@ async function linkExisting(profile, missing) {
       appPath: desktopResult.appPath,
       claudeAppPath: desktopResult.claudeAppPath,
       color: desktopResult.color || null,
+      ...(desktopResult.identity ? { identity: desktopResult.identity, bundleId: desktopResult.bundleId } : {}),
     };
   } else if (next.code && profile.desktop) {
     // Existing launcher, newly linked Code target: the launcher must be
@@ -733,7 +752,30 @@ async function askDesktopQuestions(name) {
     });
   }
 
-  return { name, dataDir, appPath, claudeAppPath, applyIcon, color, seedConnectors };
+  // Own app identity (src/identity.js). Opt-in: it trades Anthropic's
+  // signature on the copy for being a separate app to macOS.
+  explain(`
+    By default the profile's copy of Claude keeps Claude's own identity
+    (bundle ID, signature and the name "Claude"), so macOS treats it and your
+    main Claude as one app. Anything macOS addresses to "Claude" then reaches
+    both: granting a permission ends with a "Quit & Reopen" that quits every
+    copy, and AppleScript or a quit by name picks one of them at random.
+
+    Giving the profile its own identity makes its copy a separate app: its
+    own bundle ID and permissions, and the launcher's name in the menu bar
+    and Dock. The copy is re-signed with a key made on this Mac for that, so
+    it no longer carries Anthropic's signature, macOS asks for your login
+    password each time it is re-signed (once per Claude update), and sign-in
+    methods that need Claude's keychain access groups (passkeys, hardware
+    keys, Microsoft Entra) are unavailable in it. Email and Google sign-in
+    are unaffected.
+  `);
+  const ownIdentity = await confirm({
+    message: "Give this profile its own app identity? (a separate app to macOS)",
+    default: false,
+  });
+
+  return { name, dataDir, appPath, claudeAppPath, applyIcon, color, seedConnectors, identity: ownIdentity ? "own" : null };
 }
 
 // ===========================================================================
@@ -810,13 +852,17 @@ async function askCodeQuestions(name) {
       setup into the new profile so you don't redo it: settings, CLAUDE.md,
       skills, slash commands, agents, hooks, plugins, and MCP servers.
 
+      Settings and MCP servers are copied as they are, including any API
+      keys or tokens in them. The new profile can use those credentials to
+      access the same services as your default profile.
+
       Nothing from USING that account comes along: no conversations, no
-      prompt history, no sessions, no caches. Sign-in does not carry over
-      either; Claude Code keeps it in the macOS Keychain under a key tied to
+      prompt history, no sessions, no caches. Claude's Keychain sign-in does
+      not carry over; Claude Code keeps it under a key tied to
       the config folder, so you'll sign in fresh on first launch.
     `);
     seedFromDefault = await confirm({
-      message: "Copy your Claude Code setup into the new profile? (recommended)",
+      message: "Copy your Claude Code setup, including any API keys or tokens, into the new profile?",
       default: true,
     });
   }
@@ -865,6 +911,7 @@ function printPlan({ name, desktopConfig, codeConfig }) {
     console.log(`    Launcher app: ${pathStr(tildify(desktopConfig.appPath))}`);
     console.log(`    Apply Claude icon: ${desktopConfig.applyIcon ? "yes" : "no"}`);
     console.log(`    Dock colour: ${desktopConfig.color || "none"}`);
+    console.log(`    Own app identity: ${desktopConfig.identity === "own" ? "yes" : "no"}`);
     console.log(`    Copy MCP connectors: ${desktopConfig.seedConnectors ? "yes" : "no"}\n`);
   }
   if (codeConfig) {
@@ -907,6 +954,14 @@ function printNextSteps({ name, desktopResult, codeResult }) {
       "  " + command(`open "${desktopResult.appPath}"`)
     );
     console.log("");
+    if (desktopResult.identity === "own") {
+      explain(`
+        This profile is its own app to macOS, so it asks for its own
+        permissions (Screen Recording, Accessibility, folders) the first time
+        it needs them, separately from your main Claude.
+      `);
+      console.log("");
+    }
     explain(`
       To keep it in your Dock, drag the launcher itself from ~/Applications.
 

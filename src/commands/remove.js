@@ -10,7 +10,7 @@ import fs from "node:fs";
 import { execFileSync } from "node:child_process";
 import { select, confirm } from "@inquirer/prompts";
 import { getRegistry, removeFromRegistry } from "../registry.js";
-import { removeAlias } from "../code.js";
+import { removeAlias, profileShell } from "../code.js";
 import { resyncDenyRules, stripManagedDenyRules } from "../permissions.js";
 import { removeClone, clonePathFor, cloneIsRunning } from "../appclone.js";
 import { dataDirInUse } from "../desktop.js";
@@ -154,7 +154,7 @@ export async function remove(args) {
 
   if (profile.code) {
     step("Removing Code alias");
-    const { rcPath } = removeAlias(profile.code.aliasName);
+    const { rcPath } = removeAlias(profile.code.aliasName, profileShell(profile));
     ok(`Alias removed from ${pathStr(tildify(rcPath))}.`);
 
     const wipeCodeData = await confirm({

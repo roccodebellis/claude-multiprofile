@@ -35,6 +35,7 @@ import { resyncDenyRules } from "../permissions.js";
 import {
   addAlias,
   removeAlias,
+  profileShell,
   defaultConfigDirFor,
   defaultAliasNameFor,
   defaultGhConfigDirFor,
@@ -47,9 +48,10 @@ import {
   defaultAppPathFor,
   dataDirInUse,
 } from "../desktop.js";
-import { clonePathFor, cloneIsRunning } from "../appclone.js";
+import { clonePathFor, cloneIsRunning, ensureColoredClone } from "../appclone.js";
+import { wantsOwnIdentity, ownIdentityFor, withOwnIdentity } from "../identity.js";
 import { moveUpdateBlock } from "../updates.js";
-import { RESERVED_NAMES } from "./add.js";
+import { RESERVED_NAMES, withoutClaudePrefix } from "./add.js";
 import {
   header,
   ok,
@@ -84,7 +86,14 @@ function moveDir(from, to) {
 export function planRenamePaths(profile, oldName, newName) {
   const plan = [];
   const newCode = profile.code ? { ...profile.code } : null;
-  const newDesktop = profile.desktop ? { ...profile.desktop } : null;
+  // A profile with its own identity keeps its bundle ID, which TCC grants and
+  // the Keychain follow; one that opted in before it was recorded records the
+  // one derived from its old name.
+  const newDesktop = profile.desktop
+    ? wantsOwnIdentity(profile.desktop)
+      ? withOwnIdentity(oldName, profile.desktop)
+      : { ...profile.desktop }
+    : null;
 
   if (profile.code) {
     const defaultOld = defaultConfigDirFor(oldName);
@@ -157,6 +166,7 @@ export async function rename(args = []) {
         if (cleaned === oldName) return "That's the current name.";
         if (RESERVED_NAMES[cleaned]) return `"${cleaned}" is reserved. It would collide with ${RESERVED_NAMES[cleaned]}.`;
         if (findProfile(cleaned)) return `Profile "${cleaned}" already exists.`;
+        if (withoutClaudePrefix(cleaned)) return `Leave out "claude-": the tool adds it. Suggestion: "${withoutClaudePrefix(cleaned)}"`;
         return true;
       },
     });
@@ -175,6 +185,11 @@ export async function rename(args = []) {
   // command line never goes through the prompt.
   if (RESERVED_NAMES[newName]) {
     err(`"${newName}" is reserved. It would collide with ${RESERVED_NAMES[newName]}.`);
+    process.exit(1);
+  }
+  // The tool adds "Claude"/"claude-" to everything it names (#24).
+  if (withoutClaudePrefix(newName)) {
+    err(`Leave out "claude-": the tool adds it, so "${newName}" would become claude-${newName}. Try "${withoutClaudePrefix(newName)}".`);
     process.exit(1);
   }
 
@@ -251,7 +266,7 @@ export async function rename(args = []) {
       }
     }
     if (newCode.aliasName !== profile.code.aliasName) {
-      removeAlias(profile.code.aliasName);
+      removeAlias(profile.code.aliasName, profileShell(profile));
     }
     // The gh config dir lives inside the profile's config dir, so it moved
     // with it above. Recompute it from the new location so the rewritten
@@ -263,6 +278,7 @@ export async function rename(args = []) {
       aliasName: newCode.aliasName,
       configDir: newCode.configDir,
       ghConfigDir: newCode.ghConfigDir,
+      ...profileShell(profile),
     });
     newCode.rcPath = rcPath;
     ok(`Alias "${newCode.aliasName}" written to ${pathStr(tildify(rcPath))}.`);
@@ -313,6 +329,25 @@ export async function rename(args = []) {
       } catch (e) {
         warn(`Could not move its copy of Claude: ${e.message}`);
         info(`Run ${command("claude-multiprofile doctor --fix")} to build a new one.`);
+      }
+    }
+
+    // A copy with its own identity keeps its bundle ID, so its permissions
+    // stay; its app name follows the launcher. The Keychain entry is not
+    // affected: it is named after Claude's product name (src/identity.js).
+    if (wantsOwnIdentity(profile.desktop) && fileExists(newClone)) {
+      try {
+        const own = ownIdentityFor(newName, newDesktop);
+        ensureColoredClone({
+          name: newName,
+          claudeAppPath: profile.desktop.claudeAppPath,
+          color: profile.desktop.color || null,
+          identity: own,
+        });
+        ok("Its copy's name now matches the new launcher; its bundle ID and permissions are unchanged.");
+      } catch (e) {
+        warn(`Could not update its copy's identity: ${e.message}`);
+        info(`Run ${command("claude-multiprofile doctor --fix")} to apply it.`);
       }
     }
 

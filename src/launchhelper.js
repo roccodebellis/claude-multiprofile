@@ -27,21 +27,26 @@ import fs from "node:fs";
 import path from "node:path";
 import { HOME, fileExists } from "./util.js";
 import { COLORS } from "./appclone.js";
+import { IDENTITY_JXA, OWN_BUNDLE_PREFIX, OWN_BUNDLE_SUFFIX } from "./identity.js";
 
 // Bump when HELPER_JS changes, so doctor can tell a stale copy on disk.
-export const HELPER_VERSION = 1;
+export const HELPER_VERSION = 3;
 
 const TOOL_DIR = path.join(HOME, "Library", "Application Support", "claude-multiprofile");
 export const HELPER_PATH = path.join(TOOL_DIR, "bin", "launch.js");
 export const LAUNCH_LOG = path.join(TOOL_DIR, "launch.log");
 
-// What compileApp needs to route a launcher through the helper.
-export function helperSpecFor({ sourceAppPath, color, appPath }) {
+// What compileApp needs to route a launcher through the helper. `identity` is
+// the bundle ID of a profile with its own app identity (src/identity.js), or
+// null; the launcher hands it to the helper as CMP_LAUNCH_IDENTITY, and the
+// helper's label doubles as the app name.
+export function helperSpecFor({ sourceAppPath, color, appPath, identity = null }) {
   return {
     path: HELPER_PATH,
     source: sourceAppPath,
     hue: color && Object.prototype.hasOwnProperty.call(COLORS, color) ? String(COLORS[color]) : "",
     label: path.basename(appPath, ".app"),
+    identity: identity || null,
   };
 }
 
@@ -84,11 +89,34 @@ export function recentLaunchLog({ sinceMs = 7 * 24 * 3600 * 1000, levels = null 
     .filter((e) => e && e.at >= cutoff && (!levels || levels.includes(e.level)));
 }
 
+// The newest update or identity adoption a launcher started and never
+// finished: a starting line with no outcome after it. Only a helper that died
+// part-way leaves one, since both the success and the failure path log a line
+// of their own.
+export function unfinishedRefresh(label, entries = recentLaunchLog()) {
+  let pending = null;
+  for (const e of entries) {
+    if (e.label !== label) continue;
+    if (/^(updating the copy from |giving the copy its own identity )/.test(e.message)) pending = e;
+    else if (/^(updated the copy|could not update the copy|gave the copy|could not give the copy)/.test(e.message)) pending = null;
+  }
+  return pending;
+}
+
+// Folders an update leaves beside the copy only when it is cut off part-way.
+export function refreshLeftovers(clonePath) {
+  return [".refreshing", ".previous"].map((s) => clonePath + s).filter((p) => fileExists(p));
+}
+
 // ---- The helper itself -------------------------------------------------------
 //
 // argv: <clone> <source> <hue|""> <dataDir> <label> <open args...>
 // The open args are passed straight to /usr/bin/open as an array, so no path
 // is ever re-parsed by a shell.
+//
+// CMP_LAUNCH_IDENTITY=<bundle id> says the profile has its own app identity
+// (src/identity.js). A copy rebuilt here comes back with it, and a copy that
+// lacks it gets it before opening. The label is the app name.
 //
 // CMP_LAUNCH_DRY_RUN=1 prints the decision instead of acting.
 // CMP_LAUNCH_ASSUME=reopen|leave answers the wrong-account question without a
@@ -105,13 +133,17 @@ ObjC.import('CoreImage');
 var app = Application.currentApplication();
 app.includeStandardAdditions = true;
 var fm = $.NSFileManager.defaultManager;
-var LOG = $.NSHomeDirectory().js + '/Library/Application Support/claude-multiprofile/launch.log';
+var LOG = null; // set in run(): CMP_LAUNCH_LOG (tests) or the tool's own log
 var LSREGISTER = '/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister';
 var label = 'launcher';
 
 function env(name) {
   var v = $.NSProcessInfo.processInfo.environment.objectForKey(name);
   return v.isNil() ? '' : v.js;
+}
+function logPath() {
+  if (!LOG) LOG = env('CMP_LAUNCH_LOG') || ($.NSHomeDirectory().js + '/Library/Application Support/claude-multiprofile/launch.log');
+  return LOG;
 }
 function q(s) { return "'" + String(s).replace(/'/g, "'\\\\''") + "'"; }
 function exists(p) { return fm.fileExistsAtPath(p); }
@@ -126,20 +158,22 @@ function log(level, msg) {
       pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds()) + ' ' +
       label + ': ' + level + ' ' + String(msg).replace(/[\\r\\n]+/g, ' ') + '\\n';
     var data = $(line).dataUsingEncoding($.NSUTF8StringEncoding);
-    if (!exists(LOG)) { data.writeToFileAtomically(LOG, true); return; }
-    var attrs = fm.attributesOfItemAtPathError(LOG, null);
+    var LOG_ = logPath();
+    if (!exists(LOG_)) { data.writeToFileAtomically(LOG_, true); return; }
+    var attrs = fm.attributesOfItemAtPathError(LOG_, null);
     if (!attrs.isNil() && attrs.fileSize > 262144) {
       // Keep the log small: drop the older half.
-      var old = $.NSString.stringWithContentsOfFileEncodingError(LOG, $.NSUTF8StringEncoding, null).js || '';
-      $(old.slice(old.length / 2)).writeToFileAtomicallyEncodingError(LOG, true, $.NSUTF8StringEncoding, null);
+      var old = $.NSString.stringWithContentsOfFileEncodingError(LOG_, $.NSUTF8StringEncoding, null).js || '';
+      $(old.slice(old.length / 2)).writeToFileAtomicallyEncodingError(LOG_, true, $.NSUTF8StringEncoding, null);
     }
-    var h = $.NSFileHandle.fileHandleForWritingAtPath(LOG);
+    var h = $.NSFileHandle.fileHandleForWritingAtPath(LOG_);
     h.seekToEndOfFile;
     h.writeData(data);
     h.closeFile;
   } catch (e) {}
 }
 
+${IDENTITY_JXA}
 function plistValue(appPath, key) {
   var d = $.NSDictionary.dictionaryWithContentsOfFile(appPath + '/Contents/Info.plist');
   if (d.isNil()) return null;
@@ -151,9 +185,13 @@ function version(appPath) { return plistValue(appPath, 'CFBundleShortVersionStri
 // Only ever open Claude. If the path handed to us is anything else (a
 // launcher, most dangerously this one), opening it would run the helper
 // again and loop. A missing copy is different: open fails harmlessly.
+// A copy with its own identity is ours too: ${OWN_BUNDLE_PREFIX}<name>
+// plus '${OWN_BUNDLE_SUFFIX}', which no launcher carries (src/identity.js).
 function isClaude(appPath) {
   var id = plistValue(appPath, 'CFBundleIdentifier');
-  return id === null || id.indexOf('com.anthropic.') === 0;
+  if (id === null || id.indexOf('com.anthropic.') === 0) return true;
+  var prefix = '${OWN_BUNDLE_PREFIX}', suffix = '${OWN_BUNDLE_SUFFIX}';
+  return id.indexOf(prefix) === 0 && id.slice(-suffix.length) === suffix;
 }
 
 function compare(a, b) {
@@ -215,14 +253,47 @@ function tint(appPath, hue) {
   if (!ok) throw new Error('could not set the icon');
 }
 
+// An update or an identity adoption cut off part-way (#13: a launcher that
+// quit and took the helper with it) leaves folders behind; both use the same
+// .refreshing and .previous names. Put the copy back if the cut fell between
+// the two moves, clear what is left, and say so, so a helper that dies is
+// noticed on the next click instead of never.
+function recover(clone) {
+  var tmp = clone + '.refreshing', old = clone + '.previous';
+  var interrupted = false;
+  if (!exists(clone) && exists(old)) {
+    app.doShellScript('/bin/mv ' + q(old) + ' ' + q(clone));
+    log('WARN', 'an earlier update or identity change stopped between swapping the copies; put the previous copy back');
+    interrupted = true;
+  }
+  if (exists(tmp)) {
+    app.doShellScript('/bin/rm -rf ' + q(tmp));
+    log('WARN', 'an earlier update or identity change stopped part-way; removed what it left behind');
+    interrupted = true;
+  }
+  if (exists(old) && exists(clone)) app.doShellScript('/bin/rm -rf ' + q(old));
+  return interrupted;
+}
+
 // Rebuild the copy from its source when the source is newer. The new copy is
 // built beside the old one and swapped in only once it is complete, so a
 // failure at any step leaves the old copy exactly as it was.
-function refresh(clone, source, hue) {
+//
+// After an interrupted attempt (see recover), this click opens the copy as it
+// is and the next one updates it, so whatever cut the last attempt short, the
+// profile still opens rather than failing the same way again.
+function refresh(clone, source, hue, identity, interrupted) {
   var have = version(clone), want = version(source);
   if (!have || !want) { log('WARN', 'could not read versions (copy ' + have + ', source ' + want + '); opening as is'); return 'unknown'; }
   if (compare(have, want) >= 0) return 'current';
   if (env('CMP_LAUNCH_DRY_RUN') === '1') return 'would-refresh ' + have + ' -> ' + want;
+  if (interrupted) {
+    log('WARN', 'opening ' + have + ' this time; the update to ' + want + ' happens on the next click');
+    return 'deferred';
+  }
+  // Logged before any work, so a process that dies part-way still leaves a
+  // line for doctor to find.
+  log('INFO', 'updating the copy from ' + have + ' to ' + want);
 
   var tmp = clone + '.refreshing', old = clone + '.previous';
   try {
@@ -230,6 +301,8 @@ function refresh(clone, source, hue) {
     try { app.doShellScript('/bin/cp -Rc ' + q(source) + ' ' + q(tmp)); }
     catch (e) { app.doShellScript('/bin/cp -R ' + q(source) + ' ' + q(tmp)); }
     if (version(tmp) !== want) throw new Error('the copy came out as ' + version(tmp) + ', not ' + want);
+    // Identity before colour: signing would seal the colour in as detritus.
+    if (identity) applyIdentity(tmp, identity, label);
     if (hue) tint(tmp, hue);
     if (exists(old)) app.doShellScript('/bin/rm -rf ' + q(old));
     app.doShellScript('/bin/mv ' + q(clone) + ' ' + q(old));
@@ -244,6 +317,36 @@ function refresh(clone, source, hue) {
     log('ERROR', 'could not update the copy from ' + have + ' to ' + want + ': ' + e.message + '; opening ' + have);
     return 'failed';
   }
+}
+
+// A copy that lacks the identity its profile wants (the profile was switched
+// while its copy was open, so the tool could not touch it). Staged beside the
+// copy like an update, so a failure, or a cut, leaves it as it was.
+function adopt(clone, identity, hue, interrupted) {
+  if (interrupted) {
+    log('WARN', 'opening the copy as is this time; it gets its own identity on the next click');
+    return 'deferred';
+  }
+  // Logged before any work, like an update, for doctor to find.
+  log('INFO', 'giving the copy its own identity (' + identity + ')');
+  try {
+    applyIdentityStaged(clone, identity, label);
+    if (hue) tint(clone, hue);
+    try { app.doShellScript(q(LSREGISTER) + ' -f ' + q(clone)); } catch (e) {}
+    log('INFO', 'gave the copy its own identity (' + identity + ')');
+    return 'adopted';
+  } catch (e) {
+    log('ERROR', 'could not give the copy its own identity (' + identity + '): ' + e.message + '; opening as is');
+    return 'failed';
+  }
+}
+
+// The copy carries the identity and is signed with this Mac's key. A copy
+// signed by an earlier version, or before the key was made again, has a
+// requirement any program can meet, so it is adopted (re-signed) too.
+function hasIdentity(clone, identity) {
+  if (plistValue(clone, 'CFBundleIdentifier') !== identity) return false;
+  try { return idAnchored(clone, idSigner()); } catch (e) { return false; }
 }
 
 function quit(pids) {
@@ -288,6 +391,14 @@ function run(argv) {
   label = argv[4] || label;
   var openArgs = argv.slice(5);
   var dry = env('CMP_LAUNCH_DRY_RUN') === '1';
+  var identity = env('CMP_LAUNCH_IDENTITY');
+  var interrupted = false;
+  // First, because a copy cut off between the two moves is not where the
+  // checks below expect it.
+  if (!dry) {
+    try { interrupted = recover(clone); }
+    catch (e) { log('ERROR', 'could not clean up after an earlier update: ' + e.message); }
+  }
 
   if (!isClaude(clone)) {
     log('ERROR', clone + ' is not a copy of Claude (bundle ' + plistValue(clone, 'CFBundleIdentifier') +
@@ -323,8 +434,10 @@ function run(argv) {
       }
       log('INFO', 'quit the wrong-account window; reopening on the profile');
     }
-    var r = refresh(clone, source, hue);
-    if (dry) return 'not running: ' + r;
+    var r = refresh(clone, source, hue, identity, interrupted);
+    var wantsAdopt = identity && r !== 'refreshed' && !hasIdentity(clone, identity);
+    if (dry) return 'not running: ' + r + (wantsAdopt ? '; would-adopt ' + identity : '');
+    if (wantsAdopt) adopt(clone, identity, hue, interrupted);
   } catch (e) {
     log('ERROR', 'unexpected: ' + e.message + '; opening as is');
     if (dry) return 'error: ' + e.message;

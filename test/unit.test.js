@@ -10,6 +10,10 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync as execFileSyncForTests } from "node:child_process";
+
+// Real signing in tests is ad hoc: CI has no signing key (src/signing.js).
+const ADHOC = { signer: "-" };
 
 // Some tests deliberately drive refusal paths (a corrupt settings.json, a
 // symlink pointing out of the profile), and those paths warn on purpose:
@@ -1926,4 +1930,746 @@ test("doctor: a copy that is behind is information when its launcher updates it,
   assert.doesNotMatch(section, /⚠ managed:/, "the managed profile is not a warning");
   assert.match(section, /⚠ direct: copy is Claude 1\.0\.0, but 2\.0\.0 is installed/);
   assert.match(section, /Nothing updates it on its own/);
+});
+
+// ---------------------------------------------------------------------------
+// #13 - macOS 27 force-quits what a quitting launcher started
+// ---------------------------------------------------------------------------
+//
+// On macOS 27, about a second after an app quits, loginwindow force-quits
+// every process that app is responsible for. A launcher that started the
+// helper in the background and quit had it killed part-way through an update.
+// Reproduced and fixed through a real launcher click on 27.0.1.
+
+test("buildLaunchAppleScript: the launcher waits for the helper instead of backgrounding it", async () => {
+  const { buildLaunchAppleScript } = await import("../src/desktop.js");
+  const helper = { path: "/x/claude-multiprofile/bin/launch.js", source: "/Applications/Claude.app", hue: "", label: "Claude W" };
+  const s = buildLaunchAppleScript("/d", "/x/apps/Claude w.app", null, null, true, helper);
+  assert.match(s, /2>&1; else /, "the helper runs in the foreground");
+  assert.doesNotMatch(s, /launch\.js[^\n]*2>&1 & else /, "never in the background");
+});
+
+test("launcherWaitsForHelper: tells a pre-0.1.34 launcher from a current one", async (t) => {
+  if (process.platform !== "darwin") {
+    t.skip("osacompile is macOS only");
+    return;
+  }
+  const { buildLaunchAppleScript, launcherWaitsForHelper } = await import("../src/desktop.js");
+  const { execFileSync } = await import("node:child_process");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cmp-wait-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const helper = { path: path.join(root, "claude-multiprofile", "bin", "launch.js"), source: "/Applications/Claude.app", hue: "", label: "Claude W" };
+  const compile = (name, script) => {
+    const src = path.join(root, `${name}.applescript`);
+    fs.writeFileSync(src, script);
+    execFileSync("/usr/bin/osacompile", ["-o", path.join(root, `${name}.app`), src], { stdio: "pipe" });
+    return path.join(root, `${name}.app`);
+  };
+  const current = compile("Current", buildLaunchAppleScript("/d", "/x/apps/Claude w.app", null, null, true, helper));
+  // What v0.1.29 to v0.1.33 generated: the same call, backgrounded.
+  const old = compile("Old", buildLaunchAppleScript("/d", "/x/apps/Claude w.app", null, null, true, helper).replace("2>&1; else ", "2>&1 & else "));
+  const legacy = compile("Legacy", buildLaunchAppleScript("/d", "/x/apps/Claude w.app", null, null, true));
+  assert.equal(launcherWaitsForHelper(current), true);
+  assert.equal(launcherWaitsForHelper(old), false);
+  assert.equal(launcherWaitsForHelper(legacy), undefined, "no helper, nothing to wait for");
+});
+
+test("unfinishedRefresh and refreshLeftovers: what a cut-off update leaves for doctor", async () => {
+  const { unfinishedRefresh, refreshLeftovers } = await import("../src/launchhelper.js");
+  const e = (label, message) => ({ at: 0, label, level: "INFO", message });
+  assert.equal(unfinishedRefresh("Claude W", [e("Claude W", "updating the copy from 1 to 2")]).message, "updating the copy from 1 to 2");
+  assert.equal(unfinishedRefresh("Claude W", [e("Claude W", "updating the copy from 1 to 2"), e("Claude W", "updated the copy from 1 to 2")]), null);
+  assert.equal(unfinishedRefresh("Claude W", [e("Claude W", "updating the copy from 1 to 2"), e("Claude W", "could not update the copy from 1 to 2: x")]), null);
+  assert.equal(unfinishedRefresh("Claude W", [e("Claude X", "updating the copy from 1 to 2")]), null, "per launcher");
+
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cmp-left-"));
+  const clone = path.join(root, "Claude w.app");
+  fs.mkdirSync(clone + ".refreshing", { recursive: true });
+  assert.deepEqual(refreshLeftovers(clone), [clone + ".refreshing"]);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("launch helper: the click after a cut-off update recovers, opens, and the next one updates", async (t) => {
+  if (process.platform !== "darwin") {
+    t.skip("osascript is macOS only");
+    return;
+  }
+  const { HELPER_JS } = await import("../src/launchhelper.js");
+  const { execFileSync } = await import("node:child_process");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cmp-recover-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const helper = path.join(root, "launch.js");
+  fs.writeFileSync(helper, HELPER_JS);
+  const logFile = path.join(root, "launch.log");
+  const fakeApp = (dir, version) => {
+    fs.mkdirSync(path.join(dir, "Contents"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "Contents", "Info.plist"),
+      `<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.anthropic.claudefordesktop</string><key>CFBundleShortVersionString</key><string>${version}</string></dict></plist>`);
+  };
+  const source = path.join(root, "Source.app");
+  fakeApp(source, "2.0.0");
+  const clone = path.join(root, "Claude w.app");
+  // The worst cut: between the two moves. The copy is not at its own path,
+  // the previous one is beside it, and a half-made new one too.
+  fakeApp(clone + ".previous", "1.0.0");
+  fs.mkdirSync(clone + ".refreshing", { recursive: true });
+
+  const click = () => execFileSync("/usr/bin/osascript", ["-l", "JavaScript", helper, clone, source, "", path.join(root, "data"), "Claude W", "-a", clone],
+    { encoding: "utf8", env: { ...process.env, CMP_LAUNCH_LOG: logFile } }).trim();
+
+  assert.equal(click(), "opened");
+  assert.equal(fs.existsSync(path.join(clone, "Contents", "Info.plist")), true, "the copy is back at its path");
+  assert.equal(fs.existsSync(clone + ".refreshing"), false);
+  assert.equal(fs.existsSync(clone + ".previous"), false);
+  let log = fs.readFileSync(logFile, "utf8");
+  assert.match(log, /put the previous copy back/);
+  assert.match(log, /opening 1\.0\.0 this time/, "this click does not retry");
+
+  click();
+  log = fs.readFileSync(logFile, "utf8");
+  assert.match(log, /updating the copy from 1\.0\.0 to 2\.0\.0[\s\S]*updated the copy from 1\.0\.0 to 2\.0\.0/, "logged before and after");
+  assert.match(fs.readFileSync(path.join(clone, "Contents", "Info.plist"), "utf8"), /2\.0\.0/);
+});
+
+test("buildAliasLine: custom paths stay literal when profile commands run", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cmp-alias-security-"));
+  try {
+    const marker = path.join(root, "unexpected");
+    const paths = [
+      `${root}/$(touch ${marker})`,
+      `${root}/quotes'\"\\dollar$HOME\`id\``,
+      `${root}/two words`,
+    ];
+    for (const shell of ["bash", "zsh", "fish"]) {
+      if (spawnSync(shell, ["--version"]).error?.code === "ENOENT") continue;
+      for (const config of paths) {
+        const gh = config + "/github";
+        const line = buildAliasLine(shell, "claude-review", config, gh);
+        const stub = shell === "fish"
+          ? 'function claude; printf "%s\\n" "$CLAUDE_CONFIG_DIR" "$GH_CONFIG_DIR" $argv; end\n'
+          : 'claude() { printf "%s\\n" "$CLAUDE_CONFIG_DIR" "$GH_CONFIG_DIR" "$@"; }\n';
+        const script = (shell === "bash" ? "shopt -s expand_aliases\n" : "") +
+          stub + line + '\neval \'claude-review "two words"\'\n';
+        const args = shell === "fish" ? ["--no-config", "-c", script] : ["-f", "-c", script];
+        const result = spawnSync(shell, args, { encoding: "utf8" });
+        assert.equal(result.status, 0, `${shell}: ${result.stderr}`);
+        assert.equal(result.stdout, `${config}\n${gh}\ntwo words\n`, shell);
+        assert.equal(fs.existsSync(marker), false, "path must not execute a command");
+      }
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("seedConfigDir: linked settings and plugin manifests become independent copies", async () => {
+  const { seedConfigDir } = await import("../src/code.js");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cmp-linked-seed-"));
+  try {
+    const { src, userCfg } = fakeClaudeHome(root);
+    const dst = path.join(root, "new-profile");
+    const files = ["settings.json", "plugins/installed_plugins.json", "plugins/known_marketplaces.json"];
+    fs.writeFileSync(path.join(src, files[2]), JSON.stringify({ market: { installLocation: `${src}/plugins/cache/p/1.0.0` } }));
+    for (const [i, rel] of files.entries()) {
+      const file = path.join(src, rel), shared = path.join(root, `shared-${i}.json`);
+      fs.renameSync(file, shared);
+      fs.symlinkSync(shared, file);
+    }
+    const before = files.map((rel) => fs.readFileSync(path.join(src, rel), "utf8"));
+    seedConfigDir(src, dst, { userConfigFile: userCfg });
+    files.forEach((rel, i) => {
+      assert.equal(fs.readFileSync(path.join(src, rel), "utf8"), before[i], "source must stay unchanged");
+      assert.equal(fs.lstatSync(path.join(dst, rel)).isSymbolicLink(), false);
+      assert.ok(fs.readFileSync(path.join(dst, rel), "utf8").includes(dst), "new copy must be rebased");
+    });
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("rebaseJsonFile: external file and parent-directory symlinks are left untouched", async () => {
+  const { rebaseJsonFile } = await import("../src/code.js");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cmp-linked-rebase-"));
+  try {
+    const src = path.join(root, "source"), dst = path.join(root, "profile"), outside = path.join(root, "outside");
+    for (const dir of [src, dst, outside]) fs.mkdirSync(dir);
+    fs.mkdirSync(path.join(dst, "hooks")); fs.writeFileSync(path.join(dst, "hooks/a.sh"), "fixture");
+    const file = path.join(outside, "settings.json");
+    const before = JSON.stringify({ hooks: `${src}/hooks/a.sh` }); fs.writeFileSync(file, before);
+    fs.symlinkSync(file, path.join(dst, "settings.json"));
+    fs.symlinkSync(outside, path.join(dst, "plugins"));
+    for (const target of [path.join(dst, "settings.json"), path.join(dst, "plugins/settings.json")]) {
+      assert.equal(rebaseJsonFile(target, src, dst), false);
+      assert.equal(fs.readFileSync(file, "utf8"), before);
+    }
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("seedDesktopMcpServers: refuses external and broken config links, allows internal links", async () => {
+  const { seedDesktopMcpServers, desktopConfigFile } = await import("../src/desktop.js");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cmp-linked-mcp-"));
+  try {
+    const dataDir = path.join(root, "profile"); fs.mkdirSync(dataDir);
+    const outside = path.join(root, "outside.json"); fs.writeFileSync(outside, "{}");
+    const sourceFile = fakeDesktopSource(root, { demo: { command: "demo", env: { API_KEY: "dummy" } } });
+    const config = desktopConfigFile(dataDir);
+    for (const target of [outside, path.join(root, "missing.json")]) {
+      fs.symlinkSync(target, config);
+      const result = seedDesktopMcpServers(dataDir, { sourceFile });
+      assert.equal(result.status, "foreign");
+      assert.equal(result.reason, "unsafe-path");
+      assert.equal(fs.readFileSync(outside, "utf8"), "{}");
+      assert.equal(fs.existsSync(path.join(root, "missing.json")), false);
+      fs.unlinkSync(config);
+    }
+    const inside = path.join(dataDir, "internal.json"); fs.writeFileSync(inside, "{}");
+    fs.symlinkSync(inside, config);
+    assert.equal(seedDesktopMcpServers(dataDir, { sourceFile }).status, "seeded");
+    assert.equal(JSON.parse(fs.readFileSync(inside, "utf8")).mcpServers.demo.env.API_KEY, "dummy");
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("flippedClaudeMdExcludes: never rewrites a settings.json linked out of the profile", async () => {
+  const { flippedClaudeMdExcludes } = await import("../src/code.js");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cmp-flip-link-"));
+  try {
+    const def = path.join(root, ".claude"), prof = path.join(root, ".claude-work"), shared = path.join(root, "shared");
+    for (const d of [def, prof, shared]) { fs.mkdirSync(d); fs.writeFileSync(path.join(d, "CLAUDE.md"), "x"); }
+    // Settings shared between profiles through a link: the #10 restore must
+    // leave the shared file alone rather than rewrite it for every profile.
+    const target = path.join(shared, "settings.json");
+    const before = JSON.stringify({ claudeMdExcludes: [path.join(prof, "CLAUDE.md")] });
+    fs.writeFileSync(target, before);
+    fs.symlinkSync(target, path.join(prof, "settings.json"));
+    assert.deepEqual(flippedClaudeMdExcludes(path.join(prof, "settings.json"), prof, def, { apply: true }), []);
+    assert.equal(fs.readFileSync(target, "utf8"), before);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("copyExtension: refuses an extensions folder linked out of the target profile", async () => {
+  const { copyExtension } = await import("../src/commands/extensions.js");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cmp-ext-link-"));
+  try {
+    const src = path.join(root, "src-ext");
+    fs.mkdirSync(src);
+    fs.writeFileSync(path.join(src, "manifest.json"), "{}");
+    const settings = path.join(root, "src-settings.json");
+    fs.writeFileSync(settings, JSON.stringify({ apiKey: "dummy" }));
+    const ext = { id: "demo", folderPath: src, settingsPath: settings, hasSettings: true };
+    const target = path.join(root, "Claude-WORK");
+    const outside = path.join(root, "outside");
+    fs.mkdirSync(target);
+    fs.mkdirSync(outside);
+    fs.symlinkSync(outside, path.join(target, "Claude Extensions Settings"));
+    assert.throws(() => copyExtension(ext, target), /resolves outside the profile/);
+    assert.deepEqual(fs.readdirSync(outside), [], "nothing written through the link");
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("ensureConfigDir: new empty profiles are private even with a permissive umask", async () => {
+  const { ensureConfigDir } = await import("../src/code.js");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cmp-private-profile-"));
+  const previous = process.umask(0);
+  try {
+    const dst = path.join(root, "profile");
+    ensureConfigDir(dst);
+    assert.equal(fs.statSync(dst).mode & 0o777, 0o700);
+  } finally {
+    process.umask(previous);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("seedConfigDir: copied MCP credentials and the new profile are owner-only", async () => {
+  const { seedConfigDir } = await import("../src/code.js");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cmp-private-seed-"));
+  const previous = process.umask(0);
+  try {
+    const { src, userCfg } = fakeClaudeHome(root);
+    const servers = { github: { command: "demo", env: { GITHUB_TOKEN: "dummy-personal-token" } } };
+    fs.writeFileSync(userCfg, JSON.stringify({ mcpServers: servers }));
+    const dst = path.join(root, "profile");
+    seedConfigDir(src, dst, { userConfigFile: userCfg });
+    assert.equal(fs.statSync(dst).mode & 0o777, 0o700);
+    const file = path.join(dst, ".claude.json");
+    assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+    assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")).mcpServers, servers,
+      "intentional credential copying must still work");
+  } finally {
+    process.umask(previous);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// #14 - launchers named "staged"
+// ---------------------------------------------------------------------------
+
+test("compileApp: a new launcher is named after itself, not \"staged\"", async (t) => {
+  if (process.platform !== "darwin") {
+    t.skip("osacompile is macOS only");
+    return;
+  }
+  const { compileApp, getBundleName } = await import("../src/desktop.js");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cmp-name-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const appPath = path.join(root, "Claude WORK.app");
+  compileApp({ name: "work", dataDir: path.join(root, "d"), appPath, claudeAppPath: "/Applications/Claude.app" });
+  // Raycast, Alfred and the app switcher show this, so "staged" (the temporary
+  // folder it used to be compiled in) leaked straight into them.
+  assert.equal(getBundleName(appPath), "Claude WORK");
+});
+
+test("getBundleName and setBundleName: rename a launcher left as \"staged\", spaces and all", async (t) => {
+  if (process.platform !== "darwin") {
+    t.skip("plutil is macOS only");
+    return;
+  }
+  const { getBundleName, setBundleName, STAGED_LAUNCHER_NAME } = await import("../src/desktop.js");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cmp-name-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const app = path.join(root, "Claude Client Acme.app");
+  fs.mkdirSync(path.join(app, "Contents"), { recursive: true });
+  fs.writeFileSync(path.join(app, "Contents", "Info.plist"),
+    `<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleName</key><string>staged</string></dict></plist>`);
+  assert.equal(getBundleName(app), STAGED_LAUNCHER_NAME);
+  assert.equal(setBundleName(app, "Claude Client Acme"), true);
+  assert.equal(getBundleName(app), "Claude Client Acme");
+  assert.equal(getBundleName(path.join(root, "missing.app")), null);
+});
+
+// #21: a profile's alias lives in the rc file recorded when it was added.
+// Run from a session whose $SHELL is different (a Claude Code session set up
+// with bash, say), status and doctor used to look in that shell's file and
+// report every alias missing.
+
+test("status and doctor look for each alias in the rc file the profile recorded, whatever $SHELL says", async () => {
+  const { execFileSync } = await import("node:child_process");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cmp-rc-"));
+  const home = path.join(root, "home");
+  const cfg = path.join(root, "config");
+  const work = path.join(home, ".claude-work");
+  fs.mkdirSync(work, { recursive: true });
+  const zshrc = path.join(home, ".zshrc");
+  fs.writeFileSync(zshrc, [
+    "# >>> claude-multiprofile >>>",
+    `alias claude-work='CLAUDE_CONFIG_DIR="${work}" claude'`,
+    "# <<< claude-multiprofile <<<",
+    "",
+  ].join("\n"));
+  fs.mkdirSync(path.join(cfg, "claude-multiprofile"), { recursive: true });
+  fs.writeFileSync(path.join(cfg, "claude-multiprofile", "profiles.json"), JSON.stringify({
+    version: 1,
+    profiles: [{ name: "work", type: "code", desktop: null, code: { configDir: work, aliasName: "claude-work", shell: "zsh", rcPath: zshrc } }],
+  }));
+  const run = (...args) => {
+    try {
+      return execFileSync(process.execPath, [path.resolve("bin/claude-multiprofile.js"), ...args], {
+        encoding: "utf8",
+        env: { ...process.env, HOME: home, XDG_CONFIG_HOME: cfg, SHELL: "/bin/bash", NO_COLOR: "1" },
+        timeout: 60_000,
+      });
+    } catch (e) {
+      // doctor exits non-zero on unrelated findings in a bare sandbox.
+      return String(e.stdout || "");
+    }
+  };
+
+  const status = run("status");
+  assert.match(status, /✓ Shell alias "claude-work" in ~\/\.zshrc/);
+  const doctor = run("doctor");
+  assert.match(doctor, /✓ Alias "claude-work" present in ~\/\.zshrc/);
+  assert.doesNotMatch(doctor, /missing from/);
+
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("profileShell prefers what the profile recorded, and falls back to $SHELL for older entries", async () => {
+  const { profileShell } = await import("../src/code.js");
+  assert.deepEqual(profileShell({ code: { shell: "zsh", rcPath: "/x/.zshrc" } }), { shell: "zsh", rcPath: "/x/.zshrc" });
+  assert.deepEqual(profileShell({ code: { shell: "fish" } }), { shell: "fish", rcPath: rcPathForShell("fish") });
+  const saved = process.env.SHELL;
+  process.env.SHELL = "/bin/bash";
+  try {
+    assert.deepEqual(profileShell({ code: {} }), { shell: "bash", rcPath: rcPathForShell("bash") });
+  } finally {
+    if (saved === undefined) delete process.env.SHELL; else process.env.SHELL = saved;
+  }
+});
+
+test("withoutClaudePrefix: a name that would double the Claude the tool adds (#24)", async () => {
+  const { withoutClaudePrefix } = await import("../src/commands/add.js");
+  assert.equal(withoutClaudePrefix("claude-qpg"), "qpg");
+  assert.equal(withoutClaudePrefix("claude--work"), "work");
+  assert.equal(withoutClaudePrefix("claude"), null, "nothing left to keep");
+  assert.equal(withoutClaudePrefix("claudette"), null, "only the word itself");
+  assert.equal(withoutClaudePrefix("work"), null);
+});
+
+
+// ---------------------------------------------------------------------------
+// identity.js - a profile's own app identity
+// ---------------------------------------------------------------------------
+
+test("identity: bundle IDs, kinds and what a profile wants", async () => {
+  const { ownBundleIdFor, identityKind, wantsOwnIdentity, ownIdentityFor } = await import("../src/identity.js");
+  assert.equal(ownBundleIdFor("Work"), "com.claude-multiprofile.work.claude");
+  assert.equal(ownBundleIdFor("my client!"), "com.claude-multiprofile.my-client.claude");
+  // The launcher's own ID (no suffix) is never mistaken for a copy's.
+  assert.equal(identityKind("com.claude-multiprofile.work"), "foreign");
+  assert.equal(identityKind("com.claude-multiprofile.work.claude"), "own");
+  assert.equal(identityKind("com.anthropic.claudefordesktop"), "shared");
+  assert.equal(identityKind(null), "unknown");
+  assert.equal(wantsOwnIdentity({ identity: "own" }), true);
+  assert.equal(wantsOwnIdentity({}), false);
+  assert.equal(wantsOwnIdentity(null), false);
+  // The app name is the launcher's, which is the name the user knows.
+  assert.deepEqual(ownIdentityFor("work", { appPath: "/Users/x/Applications/Claude WORK.app" }), {
+    bundleId: "com.claude-multiprofile.work.claude",
+    appName: "Claude WORK",
+  });
+});
+
+test("identityStatus: what doctor says about a copy, for every combination", async () => {
+  const { identityStatus } = await import("../src/identity.js");
+  const own = { bundleId: "com.claude-multiprofile.work.claude", appName: "Claude WORK" };
+  const shared = { bundleId: "com.anthropic.claudefordesktop", name: "Claude" };
+  const onDisk = { bundleId: own.bundleId, name: own.appName };
+  assert.equal(identityStatus({ wanted: null, actual: null }), "missing");
+  assert.equal(identityStatus({ wanted: null, actual: shared }), "ok");
+  assert.equal(identityStatus({ wanted: null, actual: onDisk }), "needs-shared");
+  assert.equal(identityStatus({ wanted: own, actual: shared }), "needs-own");
+  // Right ID, wrong name (a renamed profile): still needs applying.
+  assert.equal(identityStatus({ wanted: own, actual: { ...onDisk, name: "Claude OLD" } }), "needs-own");
+  assert.equal(identityStatus({ wanted: own, actual: onDisk, signed: true }), "ok");
+  assert.equal(identityStatus({ wanted: own, actual: onDisk, signed: null }), "ok");
+  assert.equal(identityStatus({ wanted: own, actual: onDisk, signed: false }), "unsigned");
+});
+
+test("buildLaunchAppleScript: a profile with its own identity tells the helper, and doctor reads it back", async (t) => {
+  const { buildLaunchAppleScript, launcherIdentity, launcherCodeConfigDir } = await import("../src/desktop.js");
+  const base = {
+    path: "/Users/x/Library/Application Support/claude-multiprofile/bin/launch.js",
+    source: "/Applications/Claude.app",
+    hue: "",
+    label: "Claude WORK",
+  };
+  const clone = "/Users/x/Library/Application Support/claude-multiprofile/apps/Claude work.app";
+  const without = buildLaunchAppleScript("/Users/x/Claude-WORK", clone, "/c", null, true, base);
+  assert.ok(!without.includes("CMP_LAUNCH_IDENTITY"), "no identity, no variable");
+  const withId = buildLaunchAppleScript("/Users/x/Claude-WORK", clone, "/c", null, true, {
+    ...base,
+    identity: "com.claude-multiprofile.work.claude",
+  });
+  assert.ok(
+    withId.includes("CMP_LAUNCH_IDENTITY='com.claude-multiprofile.work.claude' /usr/bin/osascript"),
+    "the identity rides in the environment, right before the helper call"
+  );
+  // The fallback line (no helper on disk) never carries it: plain `open`
+  // cannot apply an identity, and must stay exactly what it was.
+  const legacy = buildLaunchAppleScript("/Users/x/Claude-WORK", clone, "/c", null, true);
+  const legacyLine = legacy.slice('do shell script "'.length, -1);
+  assert.ok(withId.includes(`else ${legacyLine} fi`));
+
+  if (process.platform !== "darwin") {
+    t.skip("osacompile is macOS only");
+    return;
+  }
+  const { execFileSync } = await import("node:child_process");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cmp-identity-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  for (const [label, script, expected] of [
+    ["with", withId, "com.claude-multiprofile.work.claude"],
+    ["without", without, null],
+  ]) {
+    const src = path.join(root, `${label}.applescript`);
+    const app = path.join(root, `${label}.app`);
+    fs.writeFileSync(src, script);
+    execFileSync("/usr/bin/osacompile", ["-o", app, src], { stdio: "pipe" });
+    assert.equal(launcherIdentity(app), expected, `read back (${label})`);
+    assert.equal(launcherCodeConfigDir(app), "/c", `the other env vars still read back (${label})`);
+  }
+  assert.equal(launcherIdentity(path.join(root, "nowhere.app")), undefined);
+});
+
+test("launch helper: accepts a copy with its own identity, and adopts one that lacks it", async (t) => {
+  if (process.platform !== "darwin") {
+    t.skip("osascript is macOS only");
+    return;
+  }
+  const { HELPER_JS } = await import("../src/launchhelper.js");
+  const { execFileSync } = await import("node:child_process");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cmp-helper-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const helper = path.join(root, "launch.js");
+  fs.writeFileSync(helper, HELPER_JS);
+
+  const fakeApp = (name, bundleId) => {
+    const dir = path.join(root, name, "Contents");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, "Info.plist"),
+      `<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>${bundleId}</string><key>CFBundleShortVersionString</key><string>2.10.0</string></dict></plist>`
+    );
+    return path.join(root, name);
+  };
+  const source = fakeApp("Source.app", "com.anthropic.claudefordesktop");
+  const decide = (clone, identity) =>
+    execFileSync(
+      "/usr/bin/osascript",
+      ["-l", "JavaScript", helper, clone, source, "", path.join(root, "data"), "Claude T", "-a", clone],
+      {
+        encoding: "utf8",
+        env: { ...process.env, CMP_LAUNCH_DRY_RUN: "1", ...(identity ? { CMP_LAUNCH_IDENTITY: identity } : {}) },
+      }
+    ).trim();
+
+  const own = "com.claude-multiprofile.t.claude";
+  // Its own identity is ours: opened, not refused as "not Claude". This one
+  // is not signed with this Mac's key, so it is re-signed first (#22 review, 1):
+  // a copy signed by an earlier version has a requirement anyone can meet.
+  assert.equal(decide(fakeApp("Own.app", own), own), `not running: current; would-adopt ${own}`);
+  // Same copy, launcher no longer passing an identity: still opened. Going
+  // back to Claude's identity is the tool's job (a fresh copy), not the helper's.
+  assert.equal(decide(fakeApp("Own2.app", own)), "not running: current");
+  // A shared copy whose profile now wants its own identity: adopted before opening.
+  assert.equal(decide(fakeApp("Shared.app", "com.anthropic.claudefordesktop"), own), `not running: current; would-adopt ${own}`);
+  // A launcher is still never opened, identity or not.
+  assert.equal(decide(fakeApp("Applet.app", "com.claude-multiprofile.t"), own), "refused: not Claude");
+});
+
+test("applyOwnIdentity: re-identifies and re-signs a real app bundle, helpers included", async (t) => {
+  if (process.platform !== "darwin" || !fs.existsSync("/System/Applications/Calculator.app")) {
+    t.skip("needs macOS and a stock app to copy");
+    return;
+  }
+  const { applyOwnIdentity, readIdentity, signatureValid } = await import("../src/identity.js");
+  const { execFileSync } = await import("node:child_process");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cmp-identity-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const app = path.join(root, "Calc.app");
+  execFileSync("/bin/cp", ["-R", "/System/Applications/Calculator.app", app]);
+  // A stand-in for an Electron helper app, named after the main bundle the
+  // way Electron names them, with a real executable so it can be signed.
+  const helper = path.join(app, "Contents", "Frameworks", "Calculator Helper (GPU).app");
+  fs.mkdirSync(path.join(helper, "Contents", "MacOS"), { recursive: true });
+  fs.copyFileSync(path.join(app, "Contents", "MacOS", "Calculator"), path.join(helper, "Contents", "MacOS", "Calculator Helper (GPU)"));
+  fs.writeFileSync(
+    path.join(helper, "Contents", "Info.plist"),
+    `<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.apple.calculator.helper</string><key>CFBundleExecutable</key><string>Calculator Helper (GPU)</string><key>CFBundleName</key><string>Calculator Helper (GPU)</string><key>CFBundlePackageType</key><string>APPL</string></dict></plist>`
+  );
+  const identity = { bundleId: "com.claude-multiprofile.t.claude", appName: "Calc T" };
+
+  assert.equal(quietly(() => applyOwnIdentity(app, identity, ADHOC)), "applied");
+  assert.deepEqual(readIdentity(app), { bundleId: identity.bundleId, name: identity.appName });
+  assert.ok(fs.existsSync(path.join(app, "Contents", "Frameworks", "Calc T Helper (GPU).app", "Contents", "MacOS", "Calc T Helper (GPU)")), "helper renamed, executable too");
+  assert.ok(!fs.existsSync(helper), "old helper name gone");
+  assert.equal(readIdentity(path.join(app, "Contents", "Frameworks", "Calc T Helper (GPU).app")).bundleId, "com.claude-multiprofile.t.claude.helper");
+  assert.equal(signatureValid(app), true, "the re-signed app verifies");
+  const requirement = execFileSync("/usr/bin/codesign", ["-d", "-r-", app], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  assert.ok(requirement.includes(`designated => identifier "${identity.bundleId}"`), `identifier-only designated requirement, got: ${requirement}`);
+  const entitlements = execFileSync("/usr/bin/codesign", ["-d", "--entitlements", "-", "--xml", app], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  assert.ok(!entitlements.includes("com.apple.application-identifier"), "restricted entitlements dropped");
+  assert.ok(!entitlements.includes("com.apple.private."), "Apple-private entitlements dropped");
+  assert.ok(!fs.existsSync(path.join(app, "Contents", "embedded.provisionprofile")));
+  // Idempotent: the same identity again is a no-op, not a second re-sign.
+  assert.equal(quietly(() => applyOwnIdentity(app, identity, ADHOC)), "already");
+});
+
+// A copy of Calculator.app with a stand-in Electron helper, named after the
+// main bundle the way Electron names them. Returns null off macOS.
+function fakeElectronApp(root) {
+  if (process.platform !== "darwin" || !fs.existsSync("/System/Applications/Calculator.app")) return null;
+  const app = path.join(root, "Calc.app");
+  execFileSyncForTests("/bin/cp", ["-R", "/System/Applications/Calculator.app", app]);
+  const helper = path.join(app, "Contents", "Frameworks", "Calculator Helper (GPU).app");
+  fs.mkdirSync(path.join(helper, "Contents", "MacOS"), { recursive: true });
+  fs.copyFileSync(path.join(app, "Contents", "MacOS", "Calculator"), path.join(helper, "Contents", "MacOS", "Calculator Helper (GPU)"));
+  fs.writeFileSync(
+    path.join(helper, "Contents", "Info.plist"),
+    `<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.apple.calculator.helper</string><key>CFBundleExecutable</key><string>Calculator Helper (GPU)</string><key>CFBundleName</key><string>Calculator Helper (GPU)</string><key>CFBundlePackageType</key><string>APPL</string></dict></plist>`
+  );
+  return { app, helper };
+}
+
+test("applyOwnIdentity: a failure part-way leaves the copy exactly as it was (#22 review, 3)", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cmp-identity-fail-"));
+  t.after(() => {
+    execFileSyncForTests("/bin/chmod", ["-R", "u+w", root]);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  const fake = fakeElectronApp(root);
+  if (!fake) {
+    t.skip("needs macOS and a stock app to copy");
+    return;
+  }
+  const { applyOwnIdentity, readIdentity, signatureValid } = await import("../src/identity.js");
+  const before = readIdentity(fake.app);
+  const signedBefore = signatureValid(fake.app);
+  // The helper's folder renames fine, but its Info.plist cannot be rewritten:
+  // the work fails after the first change to the bundle.
+  fs.chmodSync(path.join(fake.helper, "Contents"), 0o555);
+
+  assert.throws(() => quietly(() => applyOwnIdentity(fake.app, { bundleId: "com.claude-multiprofile.t.claude", appName: "Calc T" }, ADHOC)));
+  assert.deepEqual(readIdentity(fake.app), before, "Info.plist untouched");
+  assert.ok(fs.existsSync(fake.helper), "helper keeps the name Electron looks for");
+  assert.ok(!fs.existsSync(path.join(fake.app, "Contents", "Frameworks", "Calc T Helper (GPU).app")), "no half-renamed helper");
+  assert.equal(signatureValid(fake.app), signedBefore, "the signature is as it was");
+  assert.deepEqual(fs.readdirSync(root).sort(), ["Calc.app"], "nothing left beside the copy");
+});
+
+test("unfinishedRefresh: an identity adoption cut off part-way counts too (#22 review, 4)", async () => {
+  const { unfinishedRefresh } = await import("../src/launchhelper.js");
+  const e = (message) => ({ at: 0, label: "Claude W", level: "INFO", message });
+  const start = "giving the copy its own identity (com.claude-multiprofile.w.claude)";
+  assert.equal(unfinishedRefresh("Claude W", [e(start)]).message, start);
+  assert.equal(unfinishedRefresh("Claude W", [e(start), e("gave the copy its own identity (com.claude-multiprofile.w.claude)")]), null);
+  assert.equal(unfinishedRefresh("Claude W", [e(start), e("could not give the copy its own identity (x): y; opening as is")]), null);
+});
+
+test("launch helper: adopting an identity is staged, logged first, and waits a click after a cut (#22 review, 3 and 4)", async (t) => {
+  if (process.platform !== "darwin") {
+    t.skip("osascript is macOS only");
+    return;
+  }
+  const { HELPER_JS } = await import("../src/launchhelper.js");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cmp-adopt-"));
+  t.after(() => {
+    execFileSyncForTests("/bin/chmod", ["-R", "u+w", root]);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  const helper = path.join(root, "launch.js");
+  fs.writeFileSync(helper, HELPER_JS);
+  const logFile = path.join(root, "launch.log");
+  const plist = `<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.anthropic.claudefordesktop</string><key>CFBundleName</key><string>Claude</string><key>CFBundleShortVersionString</key><string>2.0.0</string></dict></plist>`;
+  const source = path.join(root, "Source.app");
+  const clone = path.join(root, "Claude w.app");
+  for (const app of [source, clone]) {
+    fs.mkdirSync(path.join(app, "Contents"), { recursive: true });
+    fs.writeFileSync(path.join(app, "Contents", "Info.plist"), plist);
+  }
+  const own = "com.claude-multiprofile.w.claude";
+  const click = () =>
+    execFileSyncForTests("/usr/bin/osascript", ["-l", "JavaScript", helper, clone, source, "", path.join(root, "data"), "Claude W", "-a", clone], {
+      encoding: "utf8",
+      env: { ...process.env, CMP_LAUNCH_LOG: logFile, CMP_LAUNCH_IDENTITY: own },
+    }).trim();
+
+  // Right after a cut-off run: open as is, adopt on the next click.
+  fs.mkdirSync(clone + ".refreshing");
+  assert.equal(click(), "opened");
+  let log = fs.readFileSync(logFile, "utf8");
+  assert.match(log, /removed what it left behind/);
+  assert.doesNotMatch(log, /giving the copy its own identity/, "no adoption on the click after a cut");
+  assert.match(log, /gets its own identity on the next click/);
+
+  // Next click: adoption runs and fails part-way (its Info.plist cannot be
+  // rewritten), and the copy is untouched.
+  fs.chmodSync(path.join(clone, "Contents"), 0o555);
+  assert.equal(click(), "opened");
+  log = fs.readFileSync(logFile, "utf8");
+  assert.match(log, /giving the copy its own identity \(com\.claude-multiprofile\.w\.claude\)[\s\S]*could not give the copy its own identity/, "logged before and after");
+  assert.equal(fs.readFileSync(path.join(clone, "Contents", "Info.plist"), "utf8"), plist, "Info.plist untouched");
+  assert.deepEqual(fs.readdirSync(root).sort(), ["Claude w.app", "Source.app", "launch.js", "launch.log"], "nothing left beside the copy");
+});
+
+test("applyOwnIdentity: hardened runtime stays on; only library validation is relaxed (#22 review, 2)", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cmp-identity-rt-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const fake = fakeElectronApp(root);
+  if (!fake) {
+    t.skip("needs macOS and a stock app to copy");
+    return;
+  }
+  const { applyOwnIdentity } = await import("../src/identity.js");
+  quietly(() => applyOwnIdentity(fake.app, { bundleId: "com.claude-multiprofile.t.claude", appName: "Calc T" }, ADHOC));
+  const helper = path.join(fake.app, "Contents", "Frameworks", "Calc T Helper (GPU).app");
+  for (const bundle of [fake.app, helper]) {
+    // codesign -dv reports on stderr.
+    const details = execFileSyncForTests("/bin/sh", ["-c", `/usr/bin/codesign -dv ${JSON.stringify(bundle)} 2>&1`], { encoding: "utf8" });
+    assert.match(details, /flags=0x[0-9a-f]+\([^)]*\bruntime\b/, `hardened runtime on: ${path.basename(bundle)}`);
+    const ents = execFileSyncForTests("/usr/bin/codesign", ["-d", "--entitlements", "-", "--xml", bundle], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    assert.ok(ents.includes("com.apple.security.cs.disable-library-validation"), `Anthropic-signed .node modules can load: ${path.basename(bundle)}`);
+    assert.ok(!ents.includes("allow-dyld-environment-variables"), `DYLD_* stays blocked: ${path.basename(bundle)}`);
+  }
+});
+
+test("own identity: the bundle ID is recorded once, so a rename keeps permissions (#22 review, 5)", async () => {
+  const { ownIdentityFor, withOwnIdentity } = await import("../src/identity.js");
+  const desktop = { dataDir: "/d", appPath: "/Users/x/Applications/Claude Work.app" };
+  const recorded = withOwnIdentity("work", desktop);
+  assert.equal(recorded.identity, "own");
+  assert.equal(recorded.bundleId, "com.claude-multiprofile.work.claude");
+  // Opting in again (or repairing) never replaces what was recorded.
+  assert.equal(withOwnIdentity("client", recorded).bundleId, "com.claude-multiprofile.work.claude");
+  // After `rename work client`: the bundle ID stays, the app name follows the launcher.
+  const renamed = { ...recorded, appPath: "/Users/x/Applications/Claude Client.app" };
+  assert.deepEqual(ownIdentityFor("client", renamed), { bundleId: "com.claude-multiprofile.work.claude", appName: "Claude Client" });
+  // A profile that opted in before the ID was recorded still gets one from its name.
+  assert.deepEqual(ownIdentityFor("work", { ...desktop, identity: "own" }), { bundleId: "com.claude-multiprofile.work.claude", appName: "Claude Work" });
+});
+
+test("rename: a profile with its own identity keeps its bundle ID, recorded or not (#22 review, 5)", async () => {
+  const { planRenamePaths } = await import("../src/commands/rename.js");
+  const { defaultDataDirFor, defaultAppPathFor } = await import("../src/desktop.js");
+  const profile = (extra) => ({
+    name: "work",
+    type: "desktop",
+    desktop: { dataDir: defaultDataDirFor("work"), appPath: defaultAppPathFor("work"), claudeAppPath: "/Applications/Claude.app", identity: "own", ...extra },
+  });
+  // Opted in before the ID was recorded: the one it has been using is recorded now.
+  assert.equal(planRenamePaths(profile({}), "work", "client").newDesktop.bundleId, "com.claude-multiprofile.work.claude");
+  assert.equal(planRenamePaths(profile({ bundleId: "com.claude-multiprofile.old.claude" }), "work", "client").newDesktop.bundleId, "com.claude-multiprofile.old.claude");
+  // A shared profile gets nothing new.
+  const shared = planRenamePaths({ ...profile({}), desktop: { ...profile({}).desktop, identity: undefined } }, "work", "client").newDesktop;
+  assert.equal(shared.bundleId, undefined);
+});
+
+test("signing: finds this Mac's signing key, untrusted or not, and only ours (#22 review, 1)", async () => {
+  const { parseSigningIdentity, SIGNING_NAME } = await import("../src/signing.js");
+  const out = `
+Policy: Code Signing
+  Matching identities
+  1) 1111111111111111111111111111111111111111 "Apple Development: someone (ABCDE12345)"
+  2) 9CA421ECB88A2FAE96E782B8DD197F0649245B99 "${SIGNING_NAME}" (CSSMERR_TP_NOT_TRUSTED)
+     2 identities found
+
+  Valid identities only
+  1) 1111111111111111111111111111111111111111 "Apple Development: someone (ABCDE12345)"
+     1 valid identities found
+`;
+  // Self-signed, so never "valid": what matters is that codesign can sign with it.
+  assert.equal(parseSigningIdentity(out), "9CA421ECB88A2FAE96E782B8DD197F0649245B99");
+  assert.equal(parseSigningIdentity(out.replace(SIGNING_NAME, "something else")), null);
+  assert.equal(parseSigningIdentity("     0 identities found\n"), null);
+});
+
+test("signing: the designated requirement is anchored to the key, not the bundle ID alone (#22 review, 1)", async () => {
+  const { designatedRequirement, requirementAnchored } = await import("../src/signing.js");
+  const leaf = "9CA421ECB88A2FAE96E782B8DD197F0649245B99";
+  assert.equal(
+    designatedRequirement("com.claude-multiprofile.work.claude", leaf),
+    'identifier "com.claude-multiprofile.work.claude" and certificate leaf = H"9ca421ecb88a2fae96e782b8dd197f0649245b99"'
+  );
+  // What codesign -d -r- prints for a copy signed that way, and for one signed before.
+  const anchored = 'designated => identifier "com.claude-multiprofile.work.claude" and certificate leaf = H"9ca421ecb88a2fae96e782b8dd197f0649245b99"\n';
+  assert.equal(requirementAnchored(anchored, leaf), true);
+  assert.equal(requirementAnchored('designated => identifier "com.claude-multiprofile.work.claude"\n', leaf), false, "claimable by anyone");
+  assert.equal(requirementAnchored(anchored, "0000000000000000000000000000000000000000"), false, "a key made since");
+});
+
+test("identityStatus: a copy signed before the key, or with another key, needs re-signing (#22 review, 1)", async () => {
+  const { identityStatus } = await import("../src/identity.js");
+  const own = { bundleId: "com.claude-multiprofile.work.claude", appName: "Claude WORK" };
+  const onDisk = { bundleId: own.bundleId, name: own.appName };
+  assert.equal(identityStatus({ wanted: own, actual: onDisk, signed: true, anchored: false }), "unanchored");
+  assert.equal(identityStatus({ wanted: own, actual: onDisk, signed: true, anchored: true }), "ok");
+  assert.equal(identityStatus({ wanted: own, actual: onDisk, signed: false, anchored: false }), "unsigned", "a broken signature first");
+  assert.equal(identityStatus({ wanted: own, actual: onDisk, signed: null }), "ok", "not checked: not reported");
+});
+
+test("signing: a declined key prompt is explained, anything else passes through (#22 review, 1)", async () => {
+  const { explainSigningError } = await import("../src/signing.js");
+  const declined = explainSigningError("/x/Claude W.app.refreshing: errSecInternalComponent");
+  assert.match(declined, /choose Allow \(not Always Allow\)/);
+  assert.equal(explainSigningError("no Info.plist in /x"), "no Info.plist in /x");
 });
